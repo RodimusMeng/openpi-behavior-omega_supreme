@@ -754,23 +754,37 @@ _CONFIGS = [
     ),
     #  ================= behavior configs =================
     TrainConfig(
-        name="pi05_b1k",
-        model=pi0_config.Pi0Config(action_horizon=32, pi05=True),
+        name="pi05_b1k_full",
+        model=pi0_config.Pi0Config(
+            action_horizon=32,
+            pi05=True,
+        ),
         data=LeRobotB1KDataConfig(
-            repo_id="turning_on_radio",
+            repo_id="b1k-v3again",
             base_config=DataConfig(
                 data_cls=_lerobot_compat.LeRobotDataset,
-                dataset_root="/viscam/u/shiyuc/openpi/2026-challenge-demos/b1k/turning_on_radio",
+                dataset_root=(
+                    "/inspire/dataset/"
+                    "behavior-1k-2026-challenge-demos/v3again"
+                ),
                 prompt_from_task=True,
-                dataset_kwargs={"tolerance_s": 5e-4},
+                dataset_kwargs={
+                    "tolerance_s": 5e-4,
+                },
             ),
             robot_config_name="b1k/R1Pro",
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
         save_interval=10_000,
         num_train_steps=50_000,
         assets_base_dir="./outputs/assets",
-        checkpoint_base_dir="./outputs/checkpoints",
+        checkpoint_base_dir=(
+            "/inspire/hdd/project/robot-reasoning/"
+            "xiangyushun-p-xiangyushun/"
+            "2026_behavior_challenge/tiancheng/checkpoints"
+        ),
     ),
     #
     # Fine-tuning Libero configs.

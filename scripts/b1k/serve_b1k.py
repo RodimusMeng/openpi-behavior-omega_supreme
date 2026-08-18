@@ -32,9 +32,14 @@ class Args:
 
     # LeRobot repo id whose checkpoint assets contain the norm stats.
     repo_id: str | None = None
+    # Optional inference-time prompt override.
+    prompt: str | None = None
+    # Action execution and replanning strategy.
     control_mode: str = "receding_horizon"
     # Number of actions to execute before replanning.
     action_horizon: int = 16
+    # Number of Euler integration steps used by the flow-matching action sampler.
+    num_flow_steps: int = 10
     # Port to serve the policy on.
     port: int = 8000
     # Record the policy's behavior for debugging.
@@ -42,11 +47,18 @@ class Args:
 
 
 def main(args: Args) -> None:
+    if args.num_flow_steps <= 0:
+        raise ValueError(f"num_flow_steps must be positive, got {args.num_flow_steps}")
+
     # Load task from registry
     task_bucket, task_name = args.task.split("/")
-    task_prompt = TASK_REGISTRY[task_bucket][task_name]
+    registry_prompt = TASK_REGISTRY[task_bucket][task_name]
+    task_prompt = args.prompt if args.prompt is not None else registry_prompt
     # log the prompt used
-    logging.info(f"Using robot: {args.robot}, prompt: {task_prompt}")
+    logging.info(
+        "Using robot: %s, prompt: %s, num_flow_steps: %d",
+        args.robot, task_prompt, args.num_flow_steps,
+    )
     
     # Load training config and override request-specific fields.
     config = _config.get_config(args.policy.config)
@@ -57,7 +69,10 @@ def main(args: Args) -> None:
     )
 
     policy = _policy_config.create_trained_policy(
-        config, args.policy.dir, default_prompt=task_prompt
+        config,
+        args.policy.dir,
+        sample_kwargs={"num_steps": args.num_flow_steps},
+        default_prompt=task_prompt,
     )
     policy_metadata = policy.metadata
 
