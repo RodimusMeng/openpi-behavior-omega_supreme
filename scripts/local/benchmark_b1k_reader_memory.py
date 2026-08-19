@@ -26,6 +26,7 @@ class Args:
     episode: int = 0
     all_episodes: bool = False
     mode: Literal["none", "rgb", "depth", "rgbd"] = "rgbd"
+    video_backend: Literal["torchcodec", "pyav"] | None = None
     pattern: Literal["sequential", "repeat", "random"] = "sequential"
     seed: int = 42
     samples: int = 1956
@@ -175,7 +176,11 @@ def main(args: Args) -> None:
     print(f"repo_id={args.repo_id}", flush=True)
     print(f"dataset_root={dataset_root}", flush=True)
     episode_selection = "all" if args.all_episodes else str(args.episode)
-    print(f"episode={episode_selection} mode={args.mode} pattern={args.pattern}", flush=True)
+    print(
+        f"episode={episode_selection} mode={args.mode} "
+        f"video_backend={args.video_backend or 'auto'} pattern={args.pattern}",
+        flush=True,
+    )
     print(f"selected_video_keys={selected_keys}", flush=True)
 
     output_file = None
@@ -201,6 +206,7 @@ def main(args: Args) -> None:
         root=dataset_root,
         episodes=None if args.all_episodes else [args.episode],
         tolerance_s=args.tolerance_s,
+        video_backend=args.video_backend,
         **dataset_kwargs,
     )
     record(sample=0, elapsed_s=0.0, label="after_init")
