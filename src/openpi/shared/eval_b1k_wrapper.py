@@ -1,8 +1,30 @@
 import numpy as np
-import torch
 from openpi_client.base_policy import BasePolicy
 from openpi_client.image_tools import resize_with_pad
+import torch
+
 from openpi.configs.robots import ROBOT_REGISTRY
+
+
+def ensure_depth_batch(depth: np.ndarray, rgb: np.ndarray) -> np.ndarray:
+    """Convert depth to B×H×W or B×H×W×1"""
+    depth = np.asarray(depth)
+    if rgb.ndim != 4:
+        raise ValueError(f"Expected batched RGB as B×H×W×C, got {rgb.shape}")
+    batch_size, height, width, _ = rgb.shape
+    # H×W or H×W×1
+    if depth.shape in ((height, width), (height, width, 1)):
+        if batch_size != 1:
+            raise ValueError("Received unbatched depth for batched RGB: " f"depth={depth.shape}, rgb={rgb.shape}")
+        return depth[None, ...]
+    # B×H×W or B×H×W×1
+    if depth.shape in ((batch_size, height, width), (batch_size, height, width, 1)):
+        return depth
+    # B×1×H×W, into channel-last
+    if depth.shape == (batch_size, 1, height, width):
+        return np.moveaxis(depth, 1, -1)
+
+    raise ValueError("Depth shape does not match paired RGB: " f"depth={depth.shape}, rgb={rgb.shape}")
 
 
 class B1KPolicyWrapper:
@@ -15,6 +37,7 @@ class B1KPolicyWrapper:
         action_horizon: int,
         max_len: int,
         obs_size: tuple[int, int] = (224, 224),
+        include_depth: bool = False,
     ) -> None:
         # Load robot config from registry
         self.robot = ROBOT_REGISTRY[robot]
@@ -25,6 +48,7 @@ class B1KPolicyWrapper:
         self.obs_size = obs_size
         self.max_len = max_len
         self.temporal_ensemble_max = 5  # max number of sequences to ensemble
+        self.include_depth = include_depth
 
         # Extract gripper indices from robot config (end-effectors to preserve)
         self.gripper_indices = []
@@ -65,36 +89,79 @@ class B1KPolicyWrapper:
 
             self.step_counter = np.zeros(batch_size, dtype=np.int32)
 
-    def process_input(self, obs: dict) -> dict:
+    def process_input(self, obs: dict) -> list[dict]:
         """
         Process the input dictionary to match the expected input format for the model.
         """
+        print("\n".join(sorted(obs.keys())))
         prop_state = obs[f"{self.robot.name}::proprio"]
         if prop_state.ndim == 1:
             prop_state = prop_state[None, :]  # Add batch dimension
         batch_size = prop_state.shape[0]
         # Process camera images from robot config
-        observations = []
-        for camera_key in sorted(self.robot.observations.keys()):
-            camera_obs = obs[self.robot.observations[camera_key].obs_key][..., :3]
-            if camera_obs.ndim == 3:
-                camera_obs = camera_obs[None, ...]  # Add batch dimension
-            observations.append(resize_with_pad(camera_obs, *self.obs_size))
+        rgb_observations: dict[str, np.ndarray] = {}
+        depth_observations: dict[str, np.ndarray] = {}
 
-        # Pad with zeros if we have fewer than 3 cameras (expected by model)
-        while len(observations) < 3:
-            observations.append(np.zeros((batch_size, *self.obs_size, 3), dtype=np.uint8))
-        img_obs = np.stack(observations, axis=1)  # Shape: (B, 3, H, W, C)
-        processed_input = [
-            {
-                "observation/image_0": img_obs[i, 0],
-                "observation/image_1": img_obs[i, 1],
-                "observation/image_2": img_obs[i, 2],
-                "observation/state": prop_state[i],
+        for camera_key in sorted(self.robot.observations.keys()):
+            camera_config = self.robot.observations[camera_key]
+            rgb = np.asarray(obs[camera_config.obs_key])[..., :3]
+            if rgb.ndim == 3:
+                rgb = rgb[None, ...]
+            if rgb.shape[0] != batch_size:
+                raise ValueError(f"{camera_key} RGB batch mismatch: " f"{rgb.shape[0]} != {batch_size}")
+
+            if not self.include_depth:
+                rgb_observations[camera_key] = resize_with_pad(rgb, *self.obs_size)
+                continue
+
+            # Only in RGBD
+            if camera_config.depth_obs_key is None:
+                raise ValueError(f"{camera_key} has no depth_obs_key")
+            if camera_config.depth_obs_key not in obs:
+                raise KeyError("Missing online depth observation: " f"{camera_config.depth_obs_key}")
+            depth = ensure_depth_batch(
+                obs[camera_config.depth_obs_key],
+                rgb,
+            )
+            rgb_observations[camera_key] = rgb
+            depth_observations[camera_key] = depth
+
+        if not self.include_depth:
+            # Pad with zeros if we have fewer than 3 cameras (expected by model)
+            observations = list(rgb_observations.values())
+
+            while len(observations) < 3:
+                observations.append(np.zeros((batch_size, *self.obs_size, 3), dtype=np.uint8))
+            img_obs = np.stack(observations, axis=1)  # Shape: (B, 3, H, W, C)
+            processed_input = [
+                {
+                    "observation/image_0": img_obs[i, 0],
+                    "observation/image_1": img_obs[i, 1],
+                    "observation/image_2": img_obs[i, 2],
+                    "observation/state": prop_state[i],
+                    "prompt": self.text_prompt,
+                }
+                for i in range(batch_size)
+            ]
+            return processed_input
+
+        processed_input = []
+        for batch_index in range(batch_size):
+            sample = {
+                "observation/state": prop_state[batch_index],
                 "prompt": self.text_prompt,
             }
-            for i in range(batch_size)
-        ]
+            for camera_key, rgb in rgb_observations.items():
+                if not camera_key.startswith("image_"):
+                    raise ValueError(f"Unsupported camera key: {camera_key!r}")
+                depth_key = camera_key.replace(
+                    "image_",
+                    "depth_",
+                    1,
+                )
+                sample[f"observation/{camera_key}"] = rgb[batch_index]
+                sample[f"observation/{depth_key}"] = depth_observations[camera_key][batch_index]
+            processed_input.append(sample)
         return processed_input
 
     def _get_current_actions(

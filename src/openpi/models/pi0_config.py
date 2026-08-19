@@ -24,6 +24,7 @@ class Pi0Config(_model.BaseModelConfig):
     # Set the model specific defaults.
     action_dim: int = 32
     action_horizon: int = 50
+    image_channels: int = 3
     max_token_len: int = None  # type: ignore
     # Pi05 has two differences from Pi0:
     # - the state input is part of the discrete language tokens rather than a continuous input that is part of the suffix
@@ -62,7 +63,9 @@ class Pi0Config(_model.BaseModelConfig):
 
     @override
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
-        image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+        image_spec = jax.ShapeDtypeStruct(
+            [batch_size, *_model.IMAGE_RESOLUTION, self.image_channels], jnp.float32
+        )
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
         with at.disable_typechecking():

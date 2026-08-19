@@ -1,6 +1,7 @@
 import dataclasses
 import logging
 import socket
+
 import tyro
 
 from openpi.configs.tasks import TASK_REGISTRY
@@ -57,16 +58,25 @@ def main(args: Args) -> None:
     # log the prompt used
     logging.info(
         "Using robot: %s, prompt: %s, num_flow_steps: %d",
-        args.robot, task_prompt, args.num_flow_steps,
+        args.robot,
+        task_prompt,
+        args.num_flow_steps,
     )
-    
+
     # Load training config and override request-specific fields.
     config = _config.get_config(args.policy.config)
     norm_stats_repo_id = args.repo_id or args.task
     logging.info("Using norm stats for repo: %s", norm_stats_repo_id)
-    config = dataclasses.replace(
-        config, data=dataclasses.replace(config.data, repo_id=norm_stats_repo_id, robot_config_name=args.robot)
+
+    include_depth = getattr(config.data, "include_depth", False)
+    data_config = dataclasses.replace(
+        config.data,
+        repo_id=norm_stats_repo_id,
+        robot_config_name=args.robot,
     )
+    if include_depth:
+        data_config = dataclasses.replace(data_config, depth_unit="m")
+    config = dataclasses.replace(config, data=data_config)
 
     policy = _policy_config.create_trained_policy(
         config,
@@ -87,6 +97,7 @@ def main(args: Args) -> None:
         control_mode=args.control_mode,
         action_horizon=args.action_horizon,
         max_len=config.model.action_horizon,
+        include_depth=include_depth,
     )
 
     hostname = socket.gethostname()

@@ -11,6 +11,14 @@ def _get_frozen_state(config: _pi0_config.Pi0Config) -> nnx.State:
     return nnx.state(abstract_model, nnx.All(nnx.Param, freeze_filter)).flat_state()
 
 
+def test_pi0_input_image_channels():
+    rgb_observation, _ = _pi0_config.Pi0Config().inputs_spec()
+    rgbd_observation, _ = _pi0_config.Pi0Config(image_channels=4).inputs_spec()
+
+    assert {image.shape[-1] for image in rgb_observation.images.values()} == {3}
+    assert {image.shape[-1] for image in rgbd_observation.images.values()} == {4}
+
+
 def test_pi0_full_finetune():
     config = _pi0_config.Pi0Config()
     state = _get_frozen_state(config)

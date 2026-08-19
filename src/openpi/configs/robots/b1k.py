@@ -1,5 +1,7 @@
-from .base_config import ObservationConfig, StateActionConfig, RobotConfig, register_robot
-
+from .base_config import ObservationConfig
+from .base_config import RobotConfig
+from .base_config import StateActionConfig
+from .base_config import register_robot
 
 # R1Pro Robot Configuration
 # Dual-arm mobile manipulator with base, torso, and multiple camera views
@@ -10,20 +12,26 @@ R1Pro = RobotConfig(
         "image_0": ObservationConfig(
             name="head",
             obs_key="robot_r1::robot_r1:zed_link:Camera:0::rgb",
+            depth_obs_key="robot_r1::robot_r1:zed_link:Camera:0::depth_linear",
             dataset_key="observation.rgb.zed_link_camera_0",
-            resolution=[240, 240]
+            depth_dataset_key="observation.depth_linear.zed_link_camera_0",
+            resolution=[240, 240],
         ),
         "image_1": ObservationConfig(
             name="left_wrist",
             obs_key="robot_r1::robot_r1:left_realsense_link:Camera:0::rgb",
+            depth_obs_key="robot_r1::robot_r1:left_realsense_link:Camera:0::depth_linear",
             dataset_key="observation.rgb.left_realsense_link_camera_0",
-            resolution=[240, 240]
+            depth_dataset_key="observation.depth_linear.left_realsense_link_camera_0",
+            resolution=[240, 240],
         ),
         "image_2": ObservationConfig(
             name="right_wrist",
             obs_key="robot_r1::robot_r1:right_realsense_link:Camera:0::rgb",
+            depth_obs_key="robot_r1::robot_r1:right_realsense_link:Camera:0::depth_linear",
             dataset_key="observation.rgb.right_realsense_link_camera_0",
-            resolution=[240, 240]
+            depth_dataset_key="observation.depth_linear.right_realsense_link_camera_0",
+            resolution=[240, 240],
         ),
     },
     action_key="action",

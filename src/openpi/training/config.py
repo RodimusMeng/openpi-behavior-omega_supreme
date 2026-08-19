@@ -377,6 +377,8 @@ class LeRobotB1KDataConfig(DataConfigFactory):
     robot_config_name: str = tyro.MISSING
     extra_delta_transform: bool = True
     action_sequence_keys: Sequence[str] = ("action",)
+    include_depth: bool = False
+    depth_unit: Literal["m", "mm"] = "mm"
 
     def _build_delta_mappings(self, robot_config) -> list[tuple[list[int], list[int]]]:
         state_slices = []
@@ -406,13 +408,26 @@ class LeRobotB1KDataConfig(DataConfigFactory):
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         robot_config = ROBOT_REGISTRY[self.robot_config_name]
+        base_config = self.create_base_config(assets_dirs, model_config)
 
         # Build repack mapping dynamically based on available observations
         repack_mapping = {}
+        video_keys = []
         for i in range(3):  # Support up to 3 cameras (image_0, image_1, image_2)
             image_key = f"image_{i}"
-            if image_key in robot_config.observations:
-                repack_mapping[f"observation/{image_key}"] = robot_config.observations[image_key].dataset_key
+            observation = robot_config.observations.get(image_key)
+            if observation is None:
+                continue
+
+            # RGB for RGB & RGBD
+            repack_mapping[f"observation/{image_key}"] = observation.dataset_key
+            video_keys.append(observation.dataset_key)
+            # Depth
+            if self.include_depth:
+                if observation.depth_dataset_key is None:
+                    raise ValueError(f"{self.robot_config_name}.{image_key} has no depth_dataset_key")
+                repack_mapping[f"observation/depth_{i}"] = observation.depth_dataset_key
+                video_keys.append(observation.depth_dataset_key)
 
         # Add non-image observations
         repack_mapping.update(
@@ -425,10 +440,16 @@ class LeRobotB1KDataConfig(DataConfigFactory):
 
         repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_mapping)])
 
-        # Prepare data for policy training
-        # Convert images to uint8 numpy arrays, add masks
+        # To tell whether should B1KInputs read and cat depth_i
         data_transforms = _transforms.Group(
-            inputs=[b1k_policy.B1KInputs(robot_config=robot_config, model_type=model_config.model_type)],
+            inputs=[
+                b1k_policy.B1KInputs(
+                    robot_config=robot_config,
+                    model_type=model_config.model_type,
+                    include_depth=self.include_depth,
+                    depth_unit=self.depth_unit,
+                )
+            ],
             outputs=[b1k_policy.B1KOutputs(action_dim=robot_config.action_dim)],
         )
 
@@ -447,7 +468,11 @@ class LeRobotB1KDataConfig(DataConfigFactory):
 
         # We return all data transforms for training and inference. No need to change anything here.
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            base_config,
+            dataset_kwargs={
+                **base_config.dataset_kwargs,
+                "video_keys": video_keys,
+            },
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -761,22 +786,19 @@ _CONFIGS = [
         ),
         data=LeRobotB1KDataConfig(
             repo_id="b1k-v3again",
+            include_depth=False,
             base_config=DataConfig(
                 data_cls=_lerobot_compat.LeRobotDataset,
-                dataset_root=(
-                    "/inspire/dataset/"
-                    "behavior-1k-2026-challenge-demos/v3again"
-                ),
+                dataset_root=("/inspire/dataset/" "behavior-1k-2026-challenge-demos/v3again"),
                 prompt_from_task=True,
                 dataset_kwargs={
                     "tolerance_s": 5e-4,
+                    "video_backend": "pyav",
                 },
             ),
             robot_config_name="b1k/R1Pro",
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi05_base/params"
-        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         save_interval=10_000,
         num_train_steps=50_000,
         assets_base_dir="./outputs/assets",
@@ -786,7 +808,38 @@ _CONFIGS = [
             "2026_behavior_challenge/tiancheng/checkpoints"
         ),
     ),
-    #
+    TrainConfig(
+        name="pi05_b1k_full_rgbd",
+        model=pi0_config.Pi0Config(
+            action_horizon=32,
+            pi05=True,
+            image_channels=4,
+        ),
+        data=LeRobotB1KDataConfig(
+            repo_id="b1k-v3again",
+            include_depth=True,
+            depth_unit="mm",
+            base_config=DataConfig(
+                data_cls=_lerobot_compat.LeRobotDataset,
+                dataset_root=("/inspire/dataset/" "behavior-1k-2026-challenge-demos/v3again"),
+                prompt_from_task=True,
+                dataset_kwargs={
+                    "tolerance_s": 5e-4,
+                    "video_backend": "pyav",
+                },
+            ),
+            robot_config_name="b1k/R1Pro",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        save_interval=10_000,
+        num_train_steps=50_000,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir=(
+            "/inspire/hdd/project/robot-reasoning/"
+            "xiangyushun-p-xiangyushun/"
+            "2026_behavior_challenge/tiancheng/checkpoints"
+        ),
+    ),
     # Fine-tuning Libero configs.
     #
     # These train configs define the hyperparameters for fine-tuning the base model on your own dataset.
