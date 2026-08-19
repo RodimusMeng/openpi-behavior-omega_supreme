@@ -166,24 +166,54 @@ def preprocess_observation(
             image = image_tools.resize_with_pad(image, *image_resolution)
 
         if train:
-            # Convert from [-1, 1] to [0, 1] for augmax.
+            # AugMax operates in [0, 1].
             image = image / 2.0 + 0.5
 
-            transforms = []
+            geometry_transforms = []
             if "wrist" not in key:
                 height, width = image.shape[1:3]
-                transforms += [
+                geometry_transforms = [
                     augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),
                     augmax.Resize(width, height),
                     augmax.Rotate((-5, 5)),
                 ]
-            transforms += [
-                augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
-            ]
-            sub_rngs = jax.random.split(rng, image.shape[0])
-            image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
 
-            # Back to [-1, 1].
+            color_transform = augmax.ColorJitter(
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+            )
+            sub_rngs = jax.random.split(rng, image.shape[0])
+
+            if image.shape[-1] == 4:
+
+                def augment_rgbd(sample_rng, sample):
+                    geometry_rng, color_rng = jax.random.split(sample_rng)
+
+                    if geometry_transforms:
+                        sample = augmax.Chain(*geometry_transforms)(
+                            geometry_rng,
+                            sample,
+                        )
+
+                    rgb = augmax.Chain(color_transform)(
+                        color_rng,
+                        sample[..., :3],
+                    )
+                    return jnp.concatenate(
+                        [rgb, sample[..., 3:4]],
+                        axis=-1,
+                    )
+
+                image = jax.vmap(augment_rgbd)(sub_rngs, image)
+
+            elif image.shape[-1] == 3:
+                # Preserve the existing RGB baseline behavior.
+                image = jax.vmap(augmax.Chain(*geometry_transforms, color_transform))(sub_rngs, image)
+
+            else:
+                raise ValueError(f"Expected RGB or RGBD image, got {image.shape[-1]} channels")
+
             image = image * 2.0 - 1.0
 
         out_images[key] = image
