@@ -830,7 +830,10 @@ _CONFIGS = [
             ),
             robot_config_name="b1k/R1Pro",
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            adapt_rgbd_stem=True,
+        ),
         save_interval=10_000,
         num_train_steps=50_000,
         assets_base_dir="./outputs/assets",

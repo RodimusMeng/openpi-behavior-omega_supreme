@@ -36,7 +36,7 @@ class NoOpWeightLoader(WeightLoader):
 
 @dataclasses.dataclass(frozen=True)
 class CheckpointWeightLoader(WeightLoader):
-    """Loads an entire set of weights from a checkpoint.
+    """Loads checkpoint weights, optionally expanding the RGB stem to RGBD.
 
     Compatible with:
       trained checkpoints:
@@ -46,12 +46,25 @@ class CheckpointWeightLoader(WeightLoader):
     """
 
     params_path: str
+    adapt_rgbd_stem: bool = False
 
     def load(self, params: at.Params) -> at.Params:
-        # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
-        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        loaded_params = _model.restore_params(
+            download.maybe_download(self.params_path),
+            restore_type=np.ndarray,
+        )
+
+        if self.adapt_rgbd_stem:
+            loaded_params = _adapt_rgbd_stem(
+                loaded_params,
+                params,
+            )
+
+        return _merge_params(
+            loaded_params,
+            params,
+            missing_regex=".*lora.*",
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -71,6 +84,54 @@ class PaliGemmaWeightLoader(WeightLoader):
         loaded_params = {"PaliGemma": flax.traverse_util.unflatten_dict(flat_params, sep="/")["params"]}
         # Add all missing weights.
         return _merge_params(loaded_params, params, missing_regex=".*")
+
+
+def _adapt_rgbd_stem(
+    loaded_params: at.Params,
+    reference_params: at.Params,
+) -> at.Params:
+    """Expand the SigLIP input stem from RGB to RGBD."""
+
+    stem_key = "PaliGemma/img/embedding/kernel"
+
+    flat_loaded = flax.traverse_util.flatten_dict(
+        loaded_params,
+        sep="/",
+    )
+    flat_reference = flax.traverse_util.flatten_dict(
+        reference_params,
+        sep="/",
+    )
+
+    if stem_key not in flat_loaded:
+        raise KeyError(f"Checkpoint has no {stem_key}")
+    if stem_key not in flat_reference:
+        raise KeyError(f"Model has no {stem_key}")
+
+    loaded_stem = flat_loaded[stem_key]
+    reference_stem = flat_reference[stem_key]
+
+    if loaded_stem.shape == reference_stem.shape:
+        return loaded_params
+
+    if loaded_stem.ndim != 4 or reference_stem.ndim != 4:
+        raise ValueError(f"Cannot adapt SigLIP stem from {loaded_stem.shape} to {reference_stem.shape}")
+
+    expected_shape = (*loaded_stem.shape[:-2], 4, loaded_stem.shape[-1])
+    if loaded_stem.shape[-2] != 3 or reference_stem.shape != expected_shape:
+        raise ValueError(f"Cannot adapt SigLIP stem from {loaded_stem.shape} to {reference_stem.shape}")
+
+    rgbd_stem = np.zeros(
+        reference_stem.shape,
+        dtype=loaded_stem.dtype,
+    )
+    rgbd_stem[..., :3, :] = loaded_stem
+    flat_loaded[stem_key] = rgbd_stem
+
+    return flax.traverse_util.unflatten_dict(
+        flat_loaded,
+        sep="/",
+    )
 
 
 def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:
