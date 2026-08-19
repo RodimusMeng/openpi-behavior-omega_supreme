@@ -8,6 +8,7 @@ import inspect
 import json
 import os
 from pathlib import Path
+import random
 import time
 from typing import Literal
 
@@ -23,8 +24,10 @@ class Args:
     repo_id: str = "b1k-v3again"
     dataset_root: str | None = None
     episode: int = 0
+    all_episodes: bool = False
     mode: Literal["none", "rgb", "depth", "rgbd"] = "rgbd"
-    pattern: Literal["sequential", "repeat"] = "sequential"
+    pattern: Literal["sequential", "repeat", "random"] = "sequential"
+    seed: int = 42
     samples: int = 1956
     report_every: int = 64
     tail_window: int = 512
@@ -171,7 +174,8 @@ def main(args: Args) -> None:
 
     print(f"repo_id={args.repo_id}", flush=True)
     print(f"dataset_root={dataset_root}", flush=True)
-    print(f"episode={args.episode} mode={args.mode} pattern={args.pattern}", flush=True)
+    episode_selection = "all" if args.all_episodes else str(args.episode)
+    print(f"episode={episode_selection} mode={args.mode} pattern={args.pattern}", flush=True)
     print(f"selected_video_keys={selected_keys}", flush=True)
 
     output_file = None
@@ -195,18 +199,28 @@ def main(args: Args) -> None:
     dataset = LeRobotDataset(
         repo_id=args.repo_id,
         root=dataset_root,
-        episodes=[args.episode],
+        episodes=None if args.all_episodes else [args.episode],
         tolerance_s=args.tolerance_s,
         **dataset_kwargs,
     )
     record(sample=0, elapsed_s=0.0, label="after_init")
 
     if len(dataset) == 0:
-        raise RuntimeError(f"Episode {args.episode} contains no samples")
+        raise RuntimeError(f"Episode selection {episode_selection} contains no samples")
+
+    random_indices: list[int] | None = None
+    if args.pattern == "random":
+        random_indices = random.Random(args.seed).sample(range(len(dataset)), k=min(args.samples, len(dataset)))
 
     read_started = time.perf_counter()
     for sample in range(1, args.samples + 1):
-        index = 0 if args.pattern == "repeat" else (sample - 1) % len(dataset)
+        if args.pattern == "repeat":
+            index = 0
+        elif args.pattern == "random":
+            assert random_indices is not None
+            index = random_indices[(sample - 1) % len(random_indices)]
+        else:
+            index = (sample - 1) % len(dataset)
         item = dataset[index]
         del item
 
