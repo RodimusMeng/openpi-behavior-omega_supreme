@@ -275,10 +275,39 @@ This starts a WebSocket policy server on `0.0.0.0:8000`. The server:
 | `--repo_id` | task bucket/name | Norm-stats asset ID if different from `--task` |
 | `--control_mode` | `receding_horizon` | Action execution mode |
 | `--action_horizon` | `16` | Steps to execute before replanning |
+| `--async_underflow_policy` | `error` | Naive-async queue underflow policy: `error` for experiments, `block` for diagnostics |
+| `--policy_seed` | `0` | JAX sampling seed restored at every episode reset |
 | `--port` | `8000` | Server port |
 | `--record` | `false` | Record policy I/O for debugging |
 
 Point your BEHAVIOR-1K robot client at the server host and port to stream observations and receive actions.
+
+#### Naive async baseline
+
+Naive async is a serving-only baseline: use the same fine-tuned checkpoint and training config. The first action chunk is
+generated synchronously. Afterwards, the server keeps executing the current chunk while one inference request runs in a
+background worker, then switches immediately to the returned chunk without averaging or conditioning on the old chunk.
+
+For a model chunk horizon `H` and replanning interval `s`, configure `0 < s < H`. The default pi0.5 B1K setup uses
+`H=32` and `s=16`:
+
+```bash
+uv run scripts/b1k/serve_b1k.py \
+    --robot b1k/R1Pro \
+    --task b1k/<TASK_NAME> \
+    --control_mode naive_async \
+    --action_horizon 16 \
+    --async_underflow_policy error \
+    --policy_seed 0 \
+    policy:checkpoint \
+    --policy.config <CONFIG_NAME> \
+    --policy.dir <CHECKPOINT_DIR>
+```
+
+If a request originates at global action step `k` and completes when the next action step is `g`, the measured delay is
+`d = g - k`; the first action selected from the new chunk is exactly `chunk[d]`. Wall-clock latency is reported for
+profiling but never used to choose the chunk index. The default `error` underflow policy fails the rollout explicitly if
+inference exhausts the old chunk, so queue stalls are not silently counted as successful naive-async execution.
 
 ---
 

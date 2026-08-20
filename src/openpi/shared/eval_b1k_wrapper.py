@@ -1,8 +1,27 @@
+import concurrent.futures
+import dataclasses
+import logging
+import threading
+import time
+
 import numpy as np
-import torch
 from openpi_client.base_policy import BasePolicy
 from openpi_client.image_tools import resize_with_pad
+import torch
+
 from openpi.configs.robots import ROBOT_REGISTRY
+
+logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ActionPlan:
+    epoch: int
+    request_id: int
+    origin_step: int
+    processed_actions: np.ndarray
+    model_actions: np.ndarray | None
+    inference_ms: float
 
 
 class B1KPolicyWrapper:
@@ -15,6 +34,7 @@ class B1KPolicyWrapper:
         action_horizon: int,
         max_len: int,
         obs_size: tuple[int, int] = (224, 224),
+        async_underflow_policy: str = "error",
     ) -> None:
         # Load robot config from registry
         self.robot = ROBOT_REGISTRY[robot]
@@ -25,6 +45,15 @@ class B1KPolicyWrapper:
         self.obs_size = obs_size
         self.max_len = max_len
         self.temporal_ensemble_max = 5  # max number of sequences to ensemble
+
+        if self.control_mode == "naive_async" and not 0 < self.action_horizon < self.max_len:
+            raise ValueError(
+                "naive_async requires 0 < action_horizon < model action horizon; "
+                f"got action_horizon={self.action_horizon}, model_horizon={self.max_len}"
+            )
+        if async_underflow_policy not in {"error", "block"}:
+            raise ValueError("async_underflow_policy must be 'error' or 'block'")
+        self.async_underflow_policy = async_underflow_policy
 
         # Extract gripper indices from robot config (end-effectors to preserve)
         self.gripper_indices = []
@@ -39,7 +68,27 @@ class B1KPolicyWrapper:
         self.num_active_sequences = None  # Shape: (batch,) - number of active sequences per batch element
         self.step_counter = None  # Shape: (batch,)
 
+        # Naive async state. All model inference, including the initial plan, runs on this single
+        # worker so reset never races a stale GPU call with a new episode.
+        self._async_lock = threading.Lock()
+        self._async_executor = (
+            concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="b1k-naive-async")
+            if self.control_mode == "naive_async"
+            else None
+        )
+        self._async_epoch = 0
+        self._async_next_action_step = 0
+        self._async_next_request_id = 0
+        self._async_last_request_origin: int | None = None
+        self._async_inflight: concurrent.futures.Future[_ActionPlan] | None = None
+        self._async_plan: _ActionPlan | None = None
+        self._async_last_delay_steps: int | None = None
+        self._async_underflow_count = 0
+        self._async_runtime_info: dict = {}
+
     def reset(self):
+        if self.control_mode == "naive_async":
+            self._reset_async_state()
         self.batch_size = None
         self.action_buffer = None
         self.sequence_indices = None
@@ -47,6 +96,36 @@ class B1KPolicyWrapper:
         self.num_active_sequences = None
         self.step_counter = None
         self.policy.reset()
+
+    def close(self) -> None:
+        if self._async_executor is None:
+            return
+        self.reset()
+        self._async_executor.shutdown(wait=True, cancel_futures=True)
+        self._async_executor = None
+
+    @property
+    def runtime_info(self) -> dict:
+        return dict(self._async_runtime_info)
+
+    def _reset_async_state(self) -> None:
+        with self._async_lock:
+            self._async_epoch += 1
+            if self._async_inflight is not None:
+                # The websocket reset is processed between action requests. Waiting here serializes the
+                # old GPU call before Policy.reset() restores the episode RNG.
+                try:
+                    self._async_inflight.result()
+                except Exception:
+                    logger.exception("Naive async inference failed while resetting")
+            self._async_inflight = None
+            self._async_next_action_step = 0
+            self._async_next_request_id = 0
+            self._async_last_request_origin = None
+            self._async_plan = None
+            self._async_last_delay_steps = None
+            self._async_underflow_count = 0
+            self._async_runtime_info = {}
 
     def _ensure_batch_initialized(self, batch_size: int, action_dim: int = None):
         """Ensure buffers are initialized for the given batch size."""
@@ -96,6 +175,183 @@ class B1KPolicyWrapper:
             for i in range(batch_size)
         ]
         return processed_input
+
+    def _run_async_inference(
+        self,
+        policy_input: dict,
+        *,
+        epoch: int,
+        request_id: int,
+        origin_step: int,
+    ) -> _ActionPlan:
+        start_time = time.monotonic()
+        result = self.policy.infer(policy_input, return_model_actions=True)
+        inference_ms = (time.monotonic() - start_time) * 1000
+
+        processed_actions = np.asarray(result["actions"]).copy()
+        if processed_actions.ndim != 2:
+            raise ValueError(
+                f"Naive async requires an unbatched [horizon, action_dim] chunk, got shape={processed_actions.shape}"
+            )
+        horizon = min(processed_actions.shape[0], self.max_len)
+        if horizon <= self.action_horizon:
+            raise ValueError(
+                "Naive async needs a model chunk longer than the replanning interval; "
+                f"got chunk_horizon={horizon}, action_horizon={self.action_horizon}"
+            )
+        processed_actions = processed_actions[:horizon]
+
+        model_actions = result.get("model_actions")
+        if model_actions is not None:
+            model_actions = np.asarray(model_actions).copy()
+            if model_actions.ndim != 2 or model_actions.shape[0] < horizon:
+                raise ValueError(
+                    "model_actions must align with the processed action chunk; "
+                    f"got model_shape={model_actions.shape}, processed_shape={processed_actions.shape}"
+                )
+            model_actions = model_actions[:horizon]
+
+        return _ActionPlan(
+            epoch=epoch,
+            request_id=request_id,
+            origin_step=origin_step,
+            processed_actions=processed_actions,
+            model_actions=model_actions,
+            inference_ms=inference_ms,
+        )
+
+    def _submit_async_inference(self, input_obs: dict, origin_step: int) -> None:
+        if self._async_executor is None or self._async_inflight is not None:
+            raise RuntimeError("Naive async inference submission violated the single-inflight invariant")
+        if input_obs[f"{self.robot.name}::proprio"].ndim != 1:
+            raise ValueError("naive_async currently supports one evaluator environment per policy server")
+
+        policy_inputs = self.process_input(input_obs)
+        if len(policy_inputs) != 1:
+            raise ValueError(f"Expected one policy input, got {len(policy_inputs)}")
+
+        request_id = self._async_next_request_id
+        self._async_next_request_id += 1
+        self._async_last_request_origin = origin_step
+        self._async_inflight = self._async_executor.submit(
+            self._run_async_inference,
+            policy_inputs[0],
+            epoch=self._async_epoch,
+            request_id=request_id,
+            origin_step=origin_step,
+        )
+        self._async_runtime_info = {
+            **self._async_runtime_info,
+            "event": "request_submitted",
+            "episode_epoch": self._async_epoch,
+            "request_id": request_id,
+            "origin_step": origin_step,
+        }
+
+    def _consume_async_result(self, *, block: bool) -> bool:
+        future = self._async_inflight
+        if future is None or (not block and not future.done()):
+            return False
+
+        plan = future.result()
+        self._async_inflight = None
+        if plan.epoch != self._async_epoch:
+            self._async_runtime_info = {
+                **self._async_runtime_info,
+                "event": "response_rejected_wrong_epoch",
+                "response_epoch": plan.epoch,
+                "episode_epoch": self._async_epoch,
+            }
+            return False
+
+        actual_delay = self._async_next_action_step - plan.origin_step
+        if actual_delay < 0 or actual_delay >= len(plan.processed_actions):
+            self._async_runtime_info = {
+                **self._async_runtime_info,
+                "event": "response_rejected_stale",
+                "request_id": plan.request_id,
+                "origin_step": plan.origin_step,
+                "actual_delay_steps": actual_delay,
+            }
+            return False
+
+        handoff_l2 = None
+        if self._async_plan is not None:
+            old_index = self._async_next_action_step - self._async_plan.origin_step
+            if 0 <= old_index < len(self._async_plan.processed_actions):
+                handoff_l2 = float(
+                    np.linalg.norm(self._async_plan.processed_actions[old_index] - plan.processed_actions[actual_delay])
+                )
+
+        self._async_plan = plan
+        self._async_last_delay_steps = actual_delay
+        self._async_runtime_info = {
+            **self._async_runtime_info,
+            "event": "response_accepted",
+            "request_id": plan.request_id,
+            "origin_step": plan.origin_step,
+            "actual_delay_steps": actual_delay,
+            "worker_inference_ms": plan.inference_ms,
+            "handoff_l2": handoff_l2,
+        }
+        return True
+
+    def act_naive_async(self, input_obs):
+        """Execute an old plan while one new full action chunk is inferred in the background."""
+        with self._async_lock:
+            current_step = self._async_next_action_step
+            self._consume_async_result(block=False)
+
+            # The first observation must synchronously seed a complete plan. Every later inference runs
+            # concurrently with execution of the still-valid tail of the current plan.
+            if self._async_plan is None:
+                if self._async_inflight is None:
+                    self._submit_async_inference(input_obs, current_step)
+                if not self._consume_async_result(block=True):
+                    raise RuntimeError("Failed to initialize the naive async action plan")
+
+            if (
+                self._async_inflight is None
+                and self._async_last_request_origin is not None
+                and current_step - self._async_last_request_origin >= self.action_horizon
+            ):
+                self._submit_async_inference(input_obs, current_step)
+                # Preserve the exact response-vs-action linearization if a very fast worker already finished.
+                self._consume_async_result(block=False)
+
+            plan = self._async_plan
+            assert plan is not None
+            plan_index = current_step - plan.origin_step
+            if not 0 <= plan_index < len(plan.processed_actions):
+                self._async_underflow_count += 1
+                if self.async_underflow_policy == "block" and self._async_inflight is not None:
+                    self._consume_async_result(block=True)
+                    plan = self._async_plan
+                    assert plan is not None
+                    plan_index = current_step - plan.origin_step
+
+                if not 0 <= plan_index < len(plan.processed_actions):
+                    raise RuntimeError(
+                        "Naive async action queue underflow: "
+                        f"step={current_step}, plan_origin={plan.origin_step}, "
+                        f"plan_horizon={len(plan.processed_actions)}, "
+                        f"last_delay={self._async_last_delay_steps}"
+                    )
+
+            action = plan.processed_actions[plan_index].copy()
+            self._async_runtime_info = {
+                **self._async_runtime_info,
+                "mode": "naive_async",
+                "action_step": current_step,
+                "source_request_id": plan.request_id,
+                "source_origin_step": plan.origin_step,
+                "source_action_index": plan_index,
+                "remaining_actions": len(plan.processed_actions) - plan_index - 1,
+                "inflight": self._async_inflight is not None,
+                "underflow_count": self._async_underflow_count,
+            }
+            self._async_next_action_step += 1
+            return torch.from_numpy(action)
 
     def _get_current_actions(
         self,
@@ -357,9 +613,10 @@ class B1KPolicyWrapper:
         """Dispatch to the appropriate action method based on control mode."""
         if self.control_mode == "receding_temporal":
             return self.act_receding_temporal(input_obs)
-        elif self.control_mode == "receding_horizon":
+        if self.control_mode == "receding_horizon":
             return self.act_receding_horizon(input_obs)
-        elif self.control_mode == "temporal_ensemble":
+        if self.control_mode == "naive_async":
+            return self.act_naive_async(input_obs)
+        if self.control_mode == "temporal_ensemble":
             return self.act_temporal_ensemble(input_obs)
-        else:
-            raise ValueError(f"Unknown control mode: {self.control_mode}")
+        raise ValueError(f"Unknown control mode: {self.control_mode}")

@@ -1,16 +1,17 @@
 import asyncio
+from copy import deepcopy
 import functools
 import http
 import logging
-import msgpack
-import numpy as np
 import time
 import traceback
+from typing import Any
+
+import msgpack
+import numpy as np
 import torch
-import websockets.asyncio.server as _server
 import websockets
-from copy import deepcopy
-from typing import Any, Optional
+import websockets.asyncio.server as _server
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -79,6 +80,9 @@ class WebsocketPolicyServer:
                 action["server_timing"] = {
                     "infer_ms": infer_time * 1000,
                 }
+                runtime_info = getattr(self._policy, "runtime_info", None)
+                if runtime_info:
+                    action["async_runtime"] = runtime_info
                 if prev_total_time is not None:
                     # We can only record the last total time since we also want to include the send time.
                     action["server_timing"]["prev_total_ms"] = prev_total_time * 1000
@@ -103,13 +107,12 @@ class WebsocketPolicyServer:
                 raise
 
 
-def _health_check(connection, request) -> Optional[Any]:
+def _health_check(connection, request) -> Any | None:
     if hasattr(request, "path") and request.path == "/healthz":
         if hasattr(connection, "respond"):
             return connection.respond(http.HTTPStatus.OK, "OK\n")
-        else:
-            # For older websockets versions, return a simple response
-            return http.HTTPStatus.OK, {"Content-Type": "text/plain"}, b"OK\n"
+        # For older websockets versions, return a simple response
+        return http.HTTPStatus.OK, {"Content-Type": "text/plain"}, b"OK\n"
     # Continue with the normal request handling.
     return None
 

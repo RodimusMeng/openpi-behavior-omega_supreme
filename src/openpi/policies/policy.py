@@ -62,10 +62,17 @@ class Policy(BasePolicy):
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
-            self._rng = rng or jax.random.key(0)
+            self._initial_rng = jax.random.key(0) if rng is None else rng
+            self._rng = self._initial_rng
 
     @override
-    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+    def infer(
+        self,
+        obs: dict,
+        *,
+        noise: np.ndarray | None = None,
+        return_model_actions: bool = False,
+    ) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
@@ -99,11 +106,21 @@ class Policy(BasePolicy):
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
+        model_actions = outputs["actions"].copy() if return_model_actions else None
         outputs = self._output_transform(outputs)
+        if model_actions is not None:
+            # Preserve the normalized, padded chunk produced directly by the model. RTC-style
+            # conditioning needs this representation, while `actions` are ready for execution.
+            outputs["model_actions"] = model_actions
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
         return outputs
+
+    @override
+    def reset(self) -> None:
+        if not self._is_pytorch_model:
+            self._rng = self._initial_rng
 
     @property
     def metadata(self) -> dict[str, Any]:
@@ -122,8 +139,18 @@ class PolicyRecorder(_base_policy.BasePolicy):
         self._record_step = 0
 
     @override
-    def infer(self, obs: dict) -> dict:  # type: ignore[misc]
-        results = self._policy.infer(obs)
+    def infer(
+        self,
+        obs: dict,
+        *,
+        noise: np.ndarray | None = None,
+        return_model_actions: bool = False,
+    ) -> dict:  # type: ignore[misc]
+        results = self._policy.infer(
+            obs,
+            noise=noise,
+            return_model_actions=return_model_actions,
+        )
 
         data = {"inputs": obs, "outputs": results}
         data = flax.traverse_util.flatten_dict(data, sep="/")
@@ -133,3 +160,7 @@ class PolicyRecorder(_base_policy.BasePolicy):
 
         np.save(output_path, np.asarray(data))
         return results
+
+    @override
+    def reset(self) -> None:
+        self._policy.reset()

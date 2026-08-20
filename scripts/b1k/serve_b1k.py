@@ -1,6 +1,7 @@
 import dataclasses
 import logging
 import socket
+
 import tyro
 
 from openpi.configs.tasks import TASK_REGISTRY
@@ -35,6 +36,10 @@ class Args:
     control_mode: str = "receding_horizon"
     # Number of actions to execute before replanning.
     action_horizon: int = 16
+    # Queue underflow behavior for naive_async. "error" keeps research runs honest; "block" is diagnostic.
+    async_underflow_policy: str = "error"
+    # Restored at every episode reset so sync and async runs consume the same sampling stream.
+    policy_seed: int = 0
     # Port to serve the policy on.
     port: int = 8000
     # Record the policy's behavior for debugging.
@@ -47,7 +52,7 @@ def main(args: Args) -> None:
     task_prompt = TASK_REGISTRY[task_bucket][task_name]
     # log the prompt used
     logging.info(f"Using robot: {args.robot}, prompt: {task_prompt}")
-    
+
     # Load training config and override request-specific fields.
     config = _config.get_config(args.policy.config)
     norm_stats_repo_id = args.repo_id or args.task
@@ -57,9 +62,21 @@ def main(args: Args) -> None:
     )
 
     policy = _policy_config.create_trained_policy(
-        config, args.policy.dir, default_prompt=task_prompt
+        config,
+        args.policy.dir,
+        default_prompt=task_prompt,
+        seed=args.policy_seed,
     )
-    policy_metadata = policy.metadata
+    policy_metadata = {
+        **policy.metadata,
+        "b1k_runtime": {
+            "control_mode": args.control_mode,
+            "replan_interval": args.action_horizon,
+            "model_action_horizon": config.model.action_horizon,
+            "model_action_dim": config.model.action_dim,
+            "policy_seed": args.policy_seed,
+        },
+    }
 
     # Record the policy's behavior.
     if args.record:
@@ -72,6 +89,7 @@ def main(args: Args) -> None:
         control_mode=args.control_mode,
         action_horizon=args.action_horizon,
         max_len=config.model.action_horizon,
+        async_underflow_policy=args.async_underflow_policy,
     )
 
     hostname = socket.gethostname()
