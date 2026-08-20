@@ -29,6 +29,10 @@ STEP_RE = re.compile(
     r"loss=(?P<loss>[-+\d.eE]+),\s+param_norm=(?P<param_norm>[-+\d.eE]+)"
 )
 PROGRESS_RE = re.compile(r"(?P<step>\d+)/(?P<total>\d+)\s+\[[^\]]*?,\s*(?P<seconds>[\d.]+)s/it\]")
+LOGGABLE_PROGRESS_RE = re.compile(
+    r"Progress on:\s+(?P<step>[\d.]+)(?P<step_unit>[kM]?it)/"
+    r"(?P<total>[\d.]+)(?P<total_unit>[kM]?it)\s+rate:(?P<seconds>[\d.]+)s/it"
+)
 
 
 def _read_text(path: Path) -> str | None:
@@ -410,6 +414,16 @@ def _parse_train_log(path: Path | None) -> dict[str, Any] | None:
             "total": int(match.group("total")),
             "seconds_per_iteration": float(match.group("seconds")),
         }
+    else:
+        loggable_matches = list(LOGGABLE_PROGRESS_RE.finditer(text))
+        if loggable_matches:
+            match = loggable_matches[-1]
+            units = {"it": 1, "kit": 1_000, "Mit": 1_000_000}
+            progress = {
+                "step": round(float(match.group("step")) * units[match.group("step_unit")]),
+                "total": round(float(match.group("total")) * units[match.group("total_unit")]),
+                "seconds_per_iteration": float(match.group("seconds")),
+            }
     return {
         "initialized_data_loader": "Initialized data loader" in text,
         "initialized_train_state": "Initialized train state" in text,
