@@ -31,8 +31,25 @@ def resize_with_pad(images: np.ndarray, height: int, width: int, method=Image.BI
     original_shape = images.shape
 
     images = images.reshape(-1, *original_shape[-3:])
-    resized = np.stack([_resize_with_pad_pil(Image.fromarray(im), height, width, method=method) for im in images])
+    resized = np.stack([_resize_with_pad_array(im, height, width, method=method) for im in images])
     return resized.reshape(*original_shape[:-3], *resized.shape[-3:])
+
+
+def _resize_with_pad_array(image: np.ndarray, height: int, width: int, method: int) -> np.ndarray:
+    """Resize one channel-last image, including float images unsupported by PIL as a whole."""
+    if image.ndim == 3 and np.issubdtype(image.dtype, np.floating):
+        return np.stack(
+            [
+                np.asarray(
+                    _resize_with_pad_pil(Image.fromarray(image[..., channel]), height, width, method=method),
+                    dtype=image.dtype,
+                )
+                for channel in range(image.shape[-1])
+            ],
+            axis=-1,
+        )
+
+    return np.asarray(_resize_with_pad_pil(Image.fromarray(image), height, width, method=method))
 
 
 def _resize_with_pad_pil(image: Image.Image, height: int, width: int, method: int) -> Image.Image:
