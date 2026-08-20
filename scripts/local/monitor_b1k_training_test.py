@@ -84,6 +84,18 @@ def test_parse_train_log_extracts_metrics_and_checkpoint(tmp_path: Path) -> None
     assert summary["waiting_for_checkpoint_manager"]
 
 
+def test_parse_train_log_supports_tqdm_loggable_progress(tmp_path: Path) -> None:
+    log_path = tmp_path / "train.log"
+    log_path.write_text(
+        "05:38:35.100 [I] Progress on: 1.30kit/1.30kit rate:6.6s/it remaining:00:00 elapsed:15:32 postfix:-\n"
+    )
+
+    summary = monitor._parse_train_log(log_path)
+
+    assert summary is not None
+    assert summary["progress"] == {"step": 1300, "total": 1300, "seconds_per_iteration": 6.6}
+
+
 def test_make_summary_excludes_warmup_and_cooldown() -> None:
     samples = [_sample(float(second), 10.0, 100) for second in range(11)]
 
