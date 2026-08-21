@@ -21,6 +21,7 @@ PROMPT_LABEL="${2:-original}"
 CUSTOM_PROMPT="${3:-}"
 SWEEP_ID="${RADIO_SWEEP_ID:-radio_h_prompt_20260812}"
 PORT="${POLICY_PORT:-8000}"
+POLICY_CONFIG="${POLICY_CONFIG:-pi05_b1k_full}"
 
 RECORD="${POLICY_RECORD:-0}"
 
@@ -28,6 +29,15 @@ RECORD="${POLICY_RECORD:-0}"
     echo "POLICY_RECORD must be 0 or 1." >&2
     exit 2
 }
+
+case "$POLICY_CONFIG" in
+    pi05_b1k_full|pi05_b1k_full_rgbd)
+        ;;
+    *)
+        echo "POLICY_CONFIG must be pi05_b1k_full or pi05_b1k_full_rgbd." >&2
+        exit 2
+        ;;
+esac
 
 RECORD_ARGS=()
 [[ "$RECORD" == "1" ]] && RECORD_ARGS=(--record)
@@ -97,6 +107,7 @@ mkdir -p "$CONFIG_DIR"
     printf 'SERVER_PROMPT_LABEL=%q\n' "$PROMPT_LABEL"
     printf 'SERVER_PROMPT=%q\n' "$EFFECTIVE_PROMPT"
     printf 'SERVER_PORT=%q\n' "$PORT"
+    printf 'SERVER_POLICY_CONFIG=%q\n' "$POLICY_CONFIG"
     printf 'SERVER_STARTED_AT=%q\n' "$(date --iso-8601=seconds)"
     printf 'SERVER_GIT_HEAD=%q\n' "$(git rev-parse HEAD)"
 } > "$CONFIG_DIR/server_config.env"
@@ -106,6 +117,7 @@ exec > >(tee "$CONFIG_DIR/server.log") 2>&1
 echo "CONFIG_DIR=$CONFIG_DIR"
 echo "HORIZON=$HORIZON"
 echo "PROMPT_LABEL=$PROMPT_LABEL"
+echo "POLICY_CONFIG=$POLICY_CONFIG"
 printf 'PROMPT=%s\n' "$EFFECTIVE_PROMPT"
 
 exec env \
@@ -115,7 +127,7 @@ exec env \
     --robot b1k/R1Pro \
     --task b1k/turning_on_radio \
     --repo-id turning_on_radio \
-    --policy.config pi05_b1k \
+    --policy.config "$POLICY_CONFIG" \
     --policy.dir "$RADIO_CKPT" \
     --control-mode receding_horizon \
     --action-horizon "$HORIZON" \
