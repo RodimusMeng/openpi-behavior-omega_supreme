@@ -10,7 +10,8 @@ challenge-track observation.
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 import dataclasses
 from typing import Any
 
@@ -109,6 +110,71 @@ def score_frozen_heads(
     return {"reward_pred": reward_np, "reward_target": reward_labels, "value_pred": value_np}
 
 
+class FrozenHeadBatchEvaluator:
+    """Evaluate frozen RM/critic on ground-truth and imagined held-out latents."""
+
+    def __init__(self, model: Any, *, torch: Any, device: str, n_history: int, use_ema: bool = True) -> None:
+        if n_history <= 0:
+            raise ValueError("n_history must be positive")
+        self.model = model
+        self.torch = torch
+        self.device = device
+        self.n_history = n_history
+        self.use_ema = use_ema
+        self.model.eval()
+
+    def evaluate(self, batch: Mapping[str, Any], *, horizon: int) -> dict[str, dict[str, np.ndarray]]:
+        if horizon <= 0:
+            raise ValueError("horizon must be positive")
+        total = self.n_history + horizon
+        obs = {key: self._device(value[:, :total]) for key, value in batch["obs"].items()}
+        actions = self._device(batch["actions"][:, :total])
+        rewards = self._device(batch["rewards"][:, :total])
+        memory_value = batch.get("memory")
+        memory = None if memory_value is None else {key: self._device(value) for key, value in memory_value.items()}
+        with self.torch.no_grad():
+            encoded = self.model.encode_obs(obs)
+            rollout_input = {key: self._zero_future(value) for key, value in encoded.items()}
+            ema = self.model.ema.use_ema_weights() if self.use_ema else nullcontext()
+            with ema:
+                imagined = self.model.generate_latent_rollouts(rollout_input, actions, memory=memory)
+            task_embedding = self.model.encode_task(batch["task"])
+        reward_target = _to_numpy_tensor(rewards)
+        result: dict[str, dict[str, np.ndarray]] = {}
+        for name, latent in (("ground_truth", encoded), ("imagined", imagined)):
+            scored = score_frozen_heads(
+                self.model,
+                encoded_obs=latent,
+                actions=actions,
+                task_embedding=task_embedding,
+                rewards=reward_target,
+                torch=self.torch,
+            )
+            start = self.n_history - 1
+            result[name] = {
+                "reward_pred": scored["reward_pred"][:, start:-1],
+                "reward_target": reward_target[:, start:-1],
+                "value_pred": scored["value_pred"][:, start:-1],
+                "value_target": _critic_targets(
+                    reward_target[:, start:-1],
+                    scored["value_pred"][:, start:],
+                    gamma=float(getattr(self.model.critic, "_discount_factor", 0.99)),
+                    lam=float(getattr(self.model.critic, "_lambda", 0.95)),
+                ),
+            }
+        return result
+
+    def _device(self, value: Any) -> Any:
+        if hasattr(value, "to"):
+            return value.to(device=self.device)
+        return self.torch.as_tensor(value, device=self.device)
+
+    def _zero_future(self, value: Any) -> Any:
+        cloned = value.clone()
+        cloned[:, self.n_history :] = 0
+        return cloned
+
+
 def _ranking_metrics(
     predicted: Any | None,
     target: Any | None,
@@ -176,3 +242,17 @@ def _pearson(left: np.ndarray, right: np.ndarray) -> float | None:
     if left.size < 2 or np.std(left) == 0 or np.std(right) == 0:
         return None
     return float(np.corrcoef(left, right)[0, 1])
+
+
+def _critic_targets(rewards: np.ndarray, values: np.ndarray, *, gamma: float, lam: float) -> np.ndarray:
+    """Match frozen upstream V-lambda target for one scoreable reward slice."""
+
+    if rewards.ndim != 2 or values.shape != (rewards.shape[0], rewards.shape[1] + 1):
+        raise ValueError("critic targets require rewards (B,H) and values (B,H+1)")
+    result = np.empty_like(rewards, dtype=np.float64)
+    result[:, -1] = rewards[:, -1] + gamma * values[:, -1]
+    for index in range(rewards.shape[1] - 2, -1, -1):
+        result[:, index] = rewards[:, index] + gamma * (
+            (1.0 - lam) * values[:, index + 1] + lam * result[:, index + 1]
+        )
+    return result

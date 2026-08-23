@@ -18,6 +18,7 @@ import yaml
 
 from openpi.weaver import behavior_compliance
 from openpi.weaver import prediction_eval
+from openpi.weaver import reward_critic_eval
 from openpi.weaver import upstream_config
 from openpi.weaver.behavior_precomputed import BehaviorPrecomputed
 
@@ -48,6 +49,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Repeat for short/long-horizon evaluation; defaults to checkpoint eval_horizon/horizon",
     )
     parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--reward-critic", action="store_true", help="Also evaluate frozen RM/critic on held-out labels")
     parser.add_argument("--decode-rgb", action="store_true")
     parser.add_argument("--decode-chunk-size", type=int, default=16)
     parser.add_argument("--lpips", action="store_true", help="Compute real LPIPS; requires the optional lpips package")
@@ -94,7 +96,7 @@ def load_evaluation_config(
         raw,
         dataset_root=dataset_root,
         norm_stats_path=norm_stats_path,
-        dynamics_only=True,
+        dynamics_only=not args.reward_critic,
     )
     for expression in args.inference_override:
         _apply_override(config, f"inference.{expression}")
@@ -105,7 +107,7 @@ def load_evaluation_config(
     # entrypoint and allowing access to every current/future upstream knob.
     for expression in args.override:
         _apply_override(config, expression)
-    _validate_config(config)
+    _validate_config(config, reward_critic=args.reward_critic)
     return config, report
 
 
@@ -147,7 +149,7 @@ def run(
         t_memory=int(config["t_memory"]),
         normalize=bool(dataset_cfg["normalize"]),
         norm_stats_path=dataset_cfg.get("norm_stats_path"),
-        reward_mode="disabled",
+        reward_mode="required" if args.reward_critic else "disabled",
         collapse_prob=0.0,
         max_trajectories=args.max_trajectories,
         latent_root=args.latent_root or dataset_cfg.get("latent_root"),
@@ -207,6 +209,7 @@ def run(
             record_sink=writer,
             lpips_metric=lpips_metric,
         )
+    head_metrics = _evaluate_reward_critic(loader, model, args=args, config=config, torch=torch) if args.reward_critic else None
     cuda_telemetry = telemetry.finish()
     summary = {
         **metric_summary,
@@ -238,6 +241,7 @@ def run(
             "lpips_net": args.lpips_net if args.lpips else None,
         },
         "telemetry": cuda_telemetry,
+        "reward_critic": head_metrics,
         "compliance_manifest": compliance,
     }
     prediction_eval.atomic_write_json(summary_path, summary)
@@ -268,15 +272,16 @@ def _apply_override(config: dict[str, Any], expression: str) -> None:
     target[parts[-1]] = value
 
 
-def _validate_config(config: Mapping[str, Any]) -> None:
+def _validate_config(config: Mapping[str, Any], *, reward_critic: bool) -> None:
     contract = upstream_config.architecture_contract(config)
     if (contract.n_states, contract.n_actions) != (23, 23):
         raise ValueError(f"B1K prediction evaluation requires 23-D state/action, got {contract}")
     dataset = config.get("dataset")
     if not isinstance(dataset, Mapping):
         raise ValueError("Resolved config has no dataset mapping")
-    if dataset.get("reward_mode") != "disabled":
-        raise ValueError("Prediction evaluation requires dataset.reward_mode='disabled'")
+    expected_reward_mode = "required" if reward_critic else "disabled"
+    if dataset.get("reward_mode") != expected_reward_mode:
+        raise ValueError(f"Evaluation requires dataset.reward_mode={expected_reward_mode!r}")
     if "model" not in config or not isinstance(config["model"], Mapping):
         raise ValueError("Resolved config has no model mapping")
     _positive_int(config["model"].get("val_steps"), name="model.val_steps")
@@ -315,6 +320,47 @@ def _state_normalization(dataset: Any) -> tuple[np.ndarray, np.ndarray]:
     if not isinstance(stats, Sequence) or len(stats) != 4:
         raise ValueError("BehaviorPrecomputed norm_stats must contain state/action mean/std")
     return np.asarray(stats[0], dtype=np.float32), np.asarray(stats[1], dtype=np.float32)
+
+
+def _evaluate_reward_critic(
+    loader: Any,
+    model: Any,
+    *,
+    args: argparse.Namespace,
+    config: Mapping[str, Any],
+    torch: Any,
+) -> dict[str, Any]:
+    evaluator = reward_critic_eval.FrozenHeadBatchEvaluator(
+        model,
+        torch=torch,
+        device=args.device,
+        n_history=int(config["n_history"]),
+        use_ema=bool(args.ema),
+    )
+    horizon = max(_resolve_horizons(args.horizon, config))
+    collected = {
+        name: {key: [] for key in ("reward_pred", "reward_target", "value_pred", "value_target")}
+        for name in ("ground_truth", "imagined")
+    }
+    for batch in loader:
+        result = evaluator.evaluate(batch, horizon=horizon)
+        for name, values in result.items():
+            for key, value in values.items():
+                collected[name][key].append(value)
+    summary = {}
+    for name, values in collected.items():
+        if not values["reward_pred"]:
+            raise ValueError("Held-out reward/critic loader yielded no batches")
+        metrics = reward_critic_eval.evaluate_predictions(
+            np.concatenate(values["reward_pred"], axis=0),
+            np.concatenate(values["reward_target"], axis=0),
+            value_pred=np.concatenate(values["value_pred"], axis=0),
+            value_target=np.concatenate(values["value_target"], axis=0),
+        )
+        summary[name] = metrics.to_dict()
+    summary["privileged_labels_are_targets_only"] = True
+    summary["same_state_candidate_ranking"] = "separate_online_oracle_gate_required"
+    return summary
 
 
 def _build_lpips_metric(torch: Any, *, device: str, network: str) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:

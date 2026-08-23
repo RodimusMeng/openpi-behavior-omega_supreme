@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import pytest
 
+from openpi.weaver.reward_critic_eval import FrozenHeadBatchEvaluator
 from openpi.weaver.reward_critic_eval import evaluate_predictions
 from openpi.weaver.reward_critic_eval import score_frozen_heads
+
+torch = pytest.importorskip("torch")
 
 
 class _NoGrad:
@@ -68,3 +71,49 @@ def test_frozen_heads_receive_no_reward_labels() -> None:
     )
     assert result["reward_pred"].shape == (1, 2)
     assert result["value_pred"].shape == (1, 2)
+
+
+def test_batch_evaluator_scores_ground_truth_and_imagined_latents() -> None:
+    class _Ema:
+        def use_ema_weights(self):
+            return _NoGrad()
+
+    class _TorchHead:
+        _discount_factor = 0.9
+        _lambda = 0.5
+
+        def __call__(self, obs, actions, task):
+            del actions, task
+            return obs["states"].sum(dim=-1)
+
+    class _TorchModel:
+        _n_history = 2
+        ema = _Ema()
+        rm = _TorchHead()
+        critic = _TorchHead()
+
+        def eval(self):
+            return self
+
+        def encode_obs(self, obs):
+            return {key: value.clone() for key, value in obs.items()}
+
+        def generate_latent_rollouts(self, obs, actions, *, memory):
+            del actions, memory
+            return {key: value + 1 for key, value in obs.items()}
+
+        def encode_task(self, task):
+            del task
+            return torch.zeros((1, 1))
+
+    batch = {
+        "obs": {"states": torch.zeros((1, 5, 23))},
+        "actions": torch.zeros((1, 5, 23)),
+        "rewards": torch.tensor([[0.0, 0.1, 0.2, 0.3, 0.4]]),
+        "task": {"text": ["task"]},
+    }
+    evaluator = FrozenHeadBatchEvaluator(_TorchModel(), torch=torch, device="cpu", n_history=2)
+    result = evaluator.evaluate(batch, horizon=3)
+    assert result["ground_truth"]["reward_pred"].shape == (1, 3)
+    assert result["imagined"]["value_target"].shape == (1, 3)
+    assert result["imagined"]["reward_pred"].mean() > result["ground_truth"]["reward_pred"].mean()
