@@ -30,6 +30,10 @@ def test_sample_policy_candidates_reuses_infer_and_freezes_post_transform_chunks
     assert pool.actions.shape == (2, 2, 23)
     assert pool.noises.shape == (2, 2, 32)
     assert pool.candidate_ids == ("candidate-0000", "candidate-0001")
+    assert len(pool.actions_sha256) == 64
+    assert pool.actions_sha256 == candidate_pool.CandidatePool(
+        actions=pool.actions.copy(), observation_digest=pool.observation_digest
+    ).actions_sha256
     np.testing.assert_array_equal(pool.actions[:, 0, 0], [3, 7])
     with pytest.raises(ValueError, match="read-only"):
         pool.actions[0, 0, 0] = 0

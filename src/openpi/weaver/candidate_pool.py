@@ -104,6 +104,16 @@ class CandidatePool:
     def candidate_ids(self) -> tuple[str, ...]:
         return tuple(f"candidate-{index:04d}" for index in range(self.num_candidates))
 
+    @property
+    def actions_sha256(self) -> str:
+        """Digest the immutable candidate tensor for downstream linkage."""
+
+        digest = hashlib.sha256()
+        digest.update(self.actions.dtype.str.encode())
+        digest.update(repr(self.actions.shape).encode())
+        digest.update(np.ascontiguousarray(self.actions).tobytes())
+        return digest.hexdigest()
+
 
 def sample_policy_candidates(
     policy: InferencePolicy,

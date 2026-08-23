@@ -1,6 +1,7 @@
 # WEAVER × BEHAVIOR-1K integration contract
 
-Status: first CPU-verifiable integration slice on `tc-b1k-weaver`.
+Status: CPU-verifiable data, transfer, training, and held-out-evaluation
+integration on `tc-b1k-weaver`; real checkpoint/GPU gates remain outstanding.
 
 This document records implementation facts. The WEAVER paper and the local
 adaptation proposal are design evidence and a research roadmap; they are not
@@ -47,11 +48,28 @@ config by `configs/robots/base_config.py`. The WEAVER boundary consumes the
 post-output-transform candidate chunks shaped `(N, T, 23)`. It must not consume
 the π0.5 model's padded `(N, T, 32)` tensor.
 
-For the first world-model experiment, actions remain the audited mixed
-environment-command representation above. This is called `policy-aligned v1`;
-it is not claimed to be a physical `[x, y, yaw, joints]` state delta. The
-current observation does not expose base `[x, y, yaw]`, so such a claim would be
-false without changing the BEHAVIOR observation protocol.
+Offline WEAVER training instead uses
+`r1pro_compact_state_delta_v1 = compact_state[k+1] - compact_state[k]` over the
+audited 5 Hz interval, with shortest-angle deltas for torso/arm joints. This is
+an observed transition target and is deliberately distinct from the raw mixed
+controller command. Its first three coordinates are changes in robot-frame
+base velocity, not base displacement; the current observation does not expose
+base `[x, y, yaw]`, so claiming otherwise would be false.
+
+Online candidate chunks cannot provide that observed future delta. Source
+inspection rules out a component-wise sum/mean adapter: base commands are
+velocities, torso/arm commands are absolute position targets, and grippers use
+controller-specific commands. The proposal's learned causal route is therefore
+the current implementation target:
+
+```text
+(current compact state, ordered 30 Hz command sequence with real durations)
+    -> expected next 5 Hz compact-state delta
+```
+
+The preserved full-rate action/timestamp arrays are the training source for
+that adapter. Until its real held-out transition error is measured, offline
+observed deltas must not be fed directly to online candidate scoring.
 
 ## Camera mapping
 
@@ -111,6 +129,33 @@ values into the policy interface.
 The online selector may receive only WEAVER predictions. Simulator oracle
 scores are diagnostic labels and must never become selector inputs.
 
+The online wrapper now freezes one candidate pool, binds the causal adapter to
+the pool's action bytes, observation digest, and action-time-edge digest, then
+executes actions from the selected original policy chunk. It fails if the
+candidate chunk does not contain the explicitly configured full WEAVER
+imagination horizon; a shorter silent rollout is not accepted.
+
+## BEHAVIOR 2026 challenge boundary
+
+Challenge evaluation is pinned to the official BEHAVIOR-1K `v3.9.1` evaluator.
+The policy-consumed observation allowlist is onboard RGB, depth/depth_linear,
+and proprioception. Evaluator transport metadata such as `task_id`, camera
+relative poses, and `need_new_action` is audited separately and is not treated
+as a visual/proprioceptive sensor modality. Simulator segmentation, object
+state, target pose, point cloud, or global pose never enters WEAVER selection.
+
+Offline BDDL/PotentialReward progress labels are explicitly privileged training
+or held-out targets. They are legal training supervision under the 2026 rules,
+but are not online selector inputs. Oracle candidate outcomes remain a separate
+diagnostic artifact and the compliance manifest rejects `oracle_used=true` for
+a submission.
+
+`scripts/b1k/check_behavior_compliance.py --submission` validates the recorded
+manifest before an official evaluator run. This code gate is not itself proof
+of a compliant submission: the server/evaluator run must also record the exact
+wrapper and robot config hashes, official result JSON/video hashes, and the
+unmodified output count.
+
 ## Checkpoint transfer contract
 
 PyTorch `strict=False` does not ignore same-name tensors with different shapes.
@@ -154,20 +199,25 @@ pytest --confcutdir=src/openpi/weaver \
   src/openpi/weaver/checkpoint_transfer_test.py
 ```
 
-Current result: 22 tests passed. Ruff passes for the new WEAVER package and the
-shared robot-contract helpers. `git diff --check` passes. A Bash executable is
-not present on the Windows development host, so the launcher has only static
-review here and still needs `bash -n` plus an actual Linux baseline launch.
+The current local gate covers numeric/reward adaptation, frame/latent cache
+linkage, `BehaviorPrecomputed`, checkpoint/EMA transfer, full/dynamics training
+contracts, and deterministic held-out prediction metrics. Real PyTorch/WEAVER
+construction and Linux commands remain server gates.
 
 ## Deliberately not claimed yet
 
 - No official checkpoint binary or norm statistics are local yet.
 - No upstream DROID/OOD inference smoke has run.
-- No B1K episode/latent dataset adapter has been validated on a real trajectory.
-- No WEAVER fine-tuning, prediction evaluation, reward/critic training, GPU
-  profiling, or online steering has run.
-- Reward targets (`potential`, potential delta, terminal `q_score`, or success)
-  remain an experiment choice.
+- No prepared artifacts have yet been regenerated from a real full
+  `b1k-v3again` episode with the current schema.
+- No real WEAVER fine-tuning, prediction rollout, reward/critic update, GPU
+  profiling, causal action-adapter fit, or online steering has run.
+- The implemented online steering wrapper and compliance checker are contract
+  code only until exercised through the v3.9.1 WebSocket evaluator on the GPU
+  server; CPU fake-model tests are not called a smoke test.
+- The implemented B1K reward label is the half-open 30 Hz sum of task-predicate
+  progress deltas. A RoboMeter progress-minus-one variant remains a separate
+  ablation and must not be mixed into the same label stream.
 - A true same-state simulator oracle requires state, task, metric, policy-buffer,
   and random-state restoration; the evaluator has no ready-made oracle API.
 
