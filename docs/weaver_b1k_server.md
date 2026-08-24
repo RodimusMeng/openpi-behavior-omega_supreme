@@ -12,6 +12,13 @@ WEAVER imagination horizon at 30 Hz → 5 Hz, and all checkpoints must be
 explicitly supplied. A 32-action policy chunk covers five complete 5-Hz
 intervals; it cannot be silently padded to H=8.
 
+The downloaded WEAVER release may omit `dataset.n_states` and/or
+`dataset.n_actions` when its concrete YAML was serialized. The adapter accepts
+that serialization defect only for the frozen released 8-D contract, records
+the inferred source field(s) in the transfer report, and still builds the
+explicit 23-D BEHAVIOR target. A normal architecture audit remains strict;
+arbitrary missing dimensions are never inferred.
+
 ## Server
 
 ```bash

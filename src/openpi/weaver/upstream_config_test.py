@@ -96,3 +96,70 @@ def test_contract_rejects_missing_or_invalid_shape_fields() -> None:
     source["defaults"]["n_history"] = True
     with pytest.raises(ValueError, match="n_history"):
         upstream_config.architecture_contract(source)
+
+
+def test_behavior_transfer_accepts_legacy_release_with_both_action_fields_omitted() -> None:
+    source = _released_config()
+    del source["defaults"]["dataset"]["n_states"]
+    del source["defaults"]["dataset"]["n_actions"]
+
+    target, report = upstream_config.build_behavior_config(
+        source,
+        dataset_root="/b1k",
+        norm_stats_path="/b1k/norm.json",
+    )
+
+    assert report.source.n_states == report.source.n_actions == 8
+    assert report.target.n_states == report.target.n_actions == 23
+    assert report.changed_fields == ("n_states", "n_actions")
+    assert report.inferred_source_fields == ("n_states", "n_actions")
+    assert target["dataset"]["n_states"] == 23
+    assert target["dataset"]["n_actions"] == 23
+
+
+def test_behavior_transfer_infers_one_missing_legacy_action_metadata_field() -> None:
+    source = _released_config()
+    del source["defaults"]["dataset"]["n_states"]
+
+    _, report = upstream_config.build_behavior_config(
+        source,
+        dataset_root="/b1k",
+        norm_stats_path="/b1k/norm.json",
+    )
+    assert report.inferred_source_fields == ("n_states",)
+
+    source = _released_config()
+    del source["defaults"]["dataset"]["n_actions"]
+    _, report = upstream_config.build_behavior_config(
+        source,
+        dataset_root="/b1k",
+        norm_stats_path="/b1k/norm.json",
+    )
+    assert report.inferred_source_fields == ("n_actions",)
+
+
+def test_behavior_transfer_rejects_partial_metadata_with_non_release_dimension() -> None:
+    source = _released_config()
+    del source["defaults"]["dataset"]["n_states"]
+    source["defaults"]["dataset"]["n_actions"] = 23
+
+    with pytest.raises(ValueError, match="frozen 8D release value"):
+        upstream_config.build_behavior_config(
+            source,
+            dataset_root="/b1k",
+            norm_stats_path="/b1k/norm.json",
+        )
+
+
+def test_behavior_transfer_rejects_missing_metadata_for_non_release_architecture() -> None:
+    source = _released_config()
+    del source["defaults"]["dataset"]["n_states"]
+    del source["defaults"]["dataset"]["n_actions"]
+    source["defaults"]["horizon"] = 12
+
+    with pytest.raises(ValueError, match="frozen DROID release architecture"):
+        upstream_config.build_behavior_config(
+            source,
+            dataset_root="/b1k",
+            norm_stats_path="/b1k/norm.json",
+        )

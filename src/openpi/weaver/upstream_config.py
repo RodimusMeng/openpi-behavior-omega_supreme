@@ -20,6 +20,17 @@ from openpi.weaver.behavior_precomputed import DEFAULT_IMAGE_KEYS
 BEHAVIOR_DATASET_NAME = "BEHAVIOR"
 BEHAVIOR_STATE_DIM = 23
 BEHAVIOR_ACTION_DIM = 23
+# The released DROID WEAVER checkpoint is an 8D model. Some published
+# checkpoint configs were materialized without these two metadata fields even
+# though the tensors still have the 8D contract.
+WEAVER_RELEASE_STATE_DIM = 8
+WEAVER_RELEASE_ACTION_DIM = 8
+WEAVER_RELEASE_IMAGE_KEYS = ("wrist_left", "exterior_1_left")
+WEAVER_RELEASE_IMAGE_SIZE = (192, 320)
+WEAVER_RELEASE_HORIZON = 8
+WEAVER_RELEASE_N_HISTORY = 2
+WEAVER_RELEASE_N_MEMORY_FRAMES = 6
+WEAVER_RELEASE_T_MEMORY = 5
 BEHAVIOR_STATE_REPRESENTATION = "r1pro_compact_state_v1"
 BEHAVIOR_ACTION_REPRESENTATION = "r1pro_compact_state_delta_v1"
 
@@ -46,6 +57,7 @@ class BehaviorConfigReport:
     source: ArchitectureContract
     target: ArchitectureContract
     changed_fields: tuple[str, ...]
+    inferred_source_fields: tuple[str, ...] = ()
 
     @property
     def is_identity(self) -> bool:
@@ -123,6 +135,7 @@ def build_behavior_config(
     """
 
     source_cfg = checkpoint_defaults(checkpoint_config)
+    source_cfg, inferred_source_fields = _materialize_released_state_action_metadata(source_cfg)
     source_contract = architecture_contract(source_cfg)
     target_keys = _string_tuple(image_keys, name="image_keys")
     if target_keys != tuple(DEFAULT_IMAGE_KEYS):
@@ -178,7 +191,61 @@ def build_behavior_config(
         source=source_contract,
         target=target_contract,
         changed_fields=changed,
+        inferred_source_fields=inferred_source_fields,
     )
+
+
+def _materialize_released_state_action_metadata(
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Materialize omitted 8D metadata from the known released WEAVER format.
+
+    ``architecture_contract`` intentionally remains fail-closed. This helper
+    is only used by the BEHAVIOR transfer builder, where the input is the
+    published DROID release; the contract parser still validates every other
+    shape-bearing field immediately afterwards.
+    """
+
+    dataset = config.get("dataset")
+    if not isinstance(dataset, dict):
+        return config, ()
+    missing = tuple(name for name in ("n_states", "n_actions") if name not in dataset)
+    if not missing:
+        return config, ()
+    try:
+        release_shape = (
+            dataset.get("name") == "DROID",
+            tuple(dataset["img_keys"]) == WEAVER_RELEASE_IMAGE_KEYS,
+            tuple(dataset["image_size"]) == WEAVER_RELEASE_IMAGE_SIZE,
+            config["horizon"] == WEAVER_RELEASE_HORIZON,
+            config["n_history"] == WEAVER_RELEASE_N_HISTORY,
+            config["n_memory_frames"] == WEAVER_RELEASE_N_MEMORY_FRAMES,
+            config["t_memory"] == WEAVER_RELEASE_T_MEMORY,
+        )
+    except (KeyError, TypeError):
+        release_shape = ()
+    if release_shape != (True, True, True, True, True, True, True):
+        raise ValueError(
+            "Cannot infer omitted WEAVER state/action metadata: config does not "
+            "match the frozen DROID release architecture"
+        )
+    for name in ("n_states", "n_actions"):
+        if name not in missing and dataset[name] not in (
+            WEAVER_RELEASE_STATE_DIM if name == "n_states" else WEAVER_RELEASE_ACTION_DIM,
+        ):
+            raise ValueError(
+                f"Cannot infer omitted WEAVER release metadata: present dataset.{name}="
+                f"{dataset[name]!r} is not the frozen 8D release value"
+            )
+    materialized = copy.deepcopy(config)
+    materialized_dataset = materialized["dataset"]
+    defaults = {
+        "n_states": WEAVER_RELEASE_STATE_DIM,
+        "n_actions": WEAVER_RELEASE_ACTION_DIM,
+    }
+    for name in missing:
+        materialized_dataset[name] = defaults[name]
+    return materialized, missing
 
 
 def _positive_int(value: Any, *, name: str) -> int:
