@@ -7,7 +7,9 @@ import pytest
 import torch
 
 from openpi.weaver.causal_action_adapter import require_world_model_horizon
+from scripts.b1k.serve_weaver_b1k import _canonical_prompt_catalog_sha256
 from scripts.b1k.serve_weaver_b1k import _load_norm
+from scripts.b1k.serve_weaver_b1k import _load_task_prompt_catalog
 from scripts.b1k.serve_weaver_b1k import _policy_include_depth
 from scripts.b1k.serve_weaver_b1k import _resize_batch
 from scripts.b1k.serve_weaver_b1k import _resolve_task
@@ -64,6 +66,35 @@ def test_resolve_task_accepts_bare_name_and_explicit_prompt() -> None:
     )
     with pytest.raises(ValueError, match="empty"):
         _resolve_task("", None, registry)
+
+
+def test_official_prompt_catalog_is_authoritative_and_hash_checked(tmp_path) -> None:
+    dataset_hash = "a" * 64
+    prompt_hash = _canonical_prompt_catalog_sha256({"official_task": "Place the object."})
+    (tmp_path / "task_prompts.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "behavior_task_prompts_v1",
+                "dataset_metadata_sha256": dataset_hash,
+                "task_catalog_sha256": prompt_hash,
+                "prompts": {"official_task": "Place the object."},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "summary.json").write_text(
+        json.dumps({"dataset_metadata_sha256": dataset_hash, "task_catalog": {"sha256": prompt_hash}}),
+        encoding="utf-8",
+    )
+    catalog = _load_task_prompt_catalog(tmp_path)
+    assert _resolve_task("b1k/official_task", None, {"b1k": {}}, catalog) == (
+        "b1k",
+        "official_task",
+        "Place the object.",
+    )
+    (tmp_path / "summary.json").write_text(json.dumps({"dataset_metadata_sha256": "b" * 64}), encoding="utf-8")
+    with pytest.raises(ValueError, match="does not match"):
+        _load_task_prompt_catalog(tmp_path)
 
 
 def test_policy_include_depth_follows_registered_rgbd_config() -> None:

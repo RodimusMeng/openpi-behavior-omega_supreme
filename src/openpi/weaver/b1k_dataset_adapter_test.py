@@ -114,7 +114,7 @@ def test_episode_timestamp_reset_cannot_cross_a_boundary():
         )
 
 
-def test_state_delta_wraps_joint_angles_but_not_velocity_or_grippers():
+def test_state_delta_matches_official_plain_subtraction():
     states = np.zeros((2, 23), dtype=np.float32)
     states[0, 0] = 1.0
     states[1, 0] = 3.0
@@ -126,7 +126,7 @@ def test_state_delta_wraps_joint_angles_but_not_velocity_or_grippers():
     actions = adapter.observed_state_delta_actions(states)
 
     assert actions[0, 0] == pytest.approx(2.0)
-    assert actions[0, 3] == pytest.approx(0.2, abs=1e-6)
+    assert actions[0, 3] == pytest.approx(-2 * np.pi + 0.2, abs=1e-6)
     assert actions[0, 14] == pytest.approx(-0.8)
     np.testing.assert_array_equal(actions[1], np.zeros(23))
 
@@ -234,7 +234,8 @@ def test_30hz_rewards_are_summed_over_each_5hz_transition():
     timestamps, raw_states, policy_actions = _synthetic_episode()
     rewards = np.arange(len(timestamps), dtype=np.float32) / 1000.0
     terminated = np.zeros(len(timestamps), dtype=bool)
-    terminated[-1] = True
+    terminated[24:] = True
+    rewards[25:] = 0.0
     episode = adapter.adapt_episode(
         episode_index=0,
         prompt="aggregate progress",
@@ -254,8 +255,76 @@ def test_30hz_rewards_are_summed_over_each_5hz_transition():
         dataset_repo_id="b1k-v3again",
         dataset_metadata_sha256="a" * 64,
     )
-    assert manifest["reward"]["representation"] == "b1k_behavior_predicate_progress_delta_5hz_v1"
+    assert manifest["reward"]["representation"] == "b1k_behavior_recorded_transition_reward_5hz_v2"
     assert manifest["reward"]["allowed_online_input"] is False
+
+
+def test_terminal_suffix_is_cropped_after_terminal_target_and_keeps_target_observation():
+    """Only the interval containing the first done may remain in a WEAVER episode.
+
+    The LeRobot row carrying ``done`` is the transition *into* the next
+    observation.  Consequently the adapter keeps the first sampled frame at
+    or after ``done + 1`` as the terminal target, but does not expose any
+    later absorbing-suffix transitions.
+    """
+    timestamps, raw_states, policy_actions = _synthetic_episode(31)
+    terminated = np.zeros(31, dtype=bool)
+    terminated[13:] = True
+    # Make post-terminal observations visibly distinct so an accidental tail
+    # leak cannot be hidden by a constant absorbing state.
+    raw_states[19:, 0] += 10000.0
+    rewards = np.zeros(31, dtype=np.float32)
+
+    episode = adapter.adapt_episode(
+        episode_index=0,
+        prompt="terminal crop",
+        timestamps_s=timestamps,
+        raw_states=raw_states,
+        policy_actions=policy_actions,
+        rewards=rewards,
+        terminated=terminated,
+    )
+
+    np.testing.assert_array_equal(episode.source_frame_indices, [0, 6, 12, 18])
+    assert episode.states.shape[0] == 4
+    assert episode.transition_valid.tolist() == [True, True, True, False]
+    # The target frame 18 is retained; rows 19..30 are not represented.
+    assert episode.states[-1, 0] == pytest.approx(raw_states[18, 0])
+    assert episode.policy_actions_at_frame[-1, 0] == pytest.approx(policy_actions[18, 0])
+
+
+def test_terminal_transition_without_a_later_observation_is_rejected():
+    timestamps, raw_states, policy_actions = _synthetic_episode(31)
+    terminated = np.zeros(31, dtype=bool)
+    terminated[-1] = True
+    with pytest.raises(ValueError, match="no later 5 Hz observation"):
+        adapter.adapt_episode(
+            episode_index=0,
+            prompt="terminal at source end",
+            timestamps_s=timestamps,
+            raw_states=raw_states,
+            policy_actions=policy_actions,
+            rewards=np.zeros(31, dtype=np.float32),
+            terminated=terminated,
+        )
+
+
+def test_nonzero_reward_after_absorbing_terminal_suffix_is_rejected():
+    timestamps, raw_states, policy_actions = _synthetic_episode(31)
+    terminated = np.zeros(31, dtype=bool)
+    terminated[13:] = True
+    rewards = np.zeros(31, dtype=np.float32)
+    rewards[20] = 1.0
+    with pytest.raises(ValueError, match="zero recorded reward after the first terminal"):
+        adapter.adapt_episode(
+            episode_index=0,
+            prompt="bad terminal reward",
+            timestamps_s=timestamps,
+            raw_states=raw_states,
+            policy_actions=policy_actions,
+            rewards=rewards,
+            terminated=terminated,
+        )
 
 
 def test_adapted_arrays_are_immutable():

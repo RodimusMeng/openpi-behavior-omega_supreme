@@ -14,11 +14,12 @@ from typing import Any
 
 import numpy as np
 
-REWARD_REPRESENTATION = "b1k_behavior_predicate_progress_delta_5hz_v1"
+REWARD_REPRESENTATION = "b1k_behavior_recorded_transition_reward_5hz_v2"
 REWARD_CONTRACT = {
     "representation": REWARD_REPRESENTATION,
     "alignment": "sum_next_reward_over_source_rows_i_to_j_exclusive",
-    "source": "LeRobot next.reward from BehaviorTask PotentialReward",
+    "source": "LeRobot next.reward as recorded by the B1K demonstration export",
+    "source_semantics": "official_BehaviorTask_PotentialReward_when_available_but_not_reconstructed_offline",
     "source_rate_hz": 30.0,
     "state_aligned": False,
     "transition_aligned": True,
@@ -43,7 +44,7 @@ def aggregate_progress_rewards(
     *,
     source_terminated: Any | None = None,
     source_truncated: Any | None = None,
-    validate_progress_range: bool = True,
+    validate_progress_range: bool = False,
     tolerance: float = 1e-5,
 ) -> AggregatedRewards:
     """Aggregate 30 Hz transition rewards onto sampled WEAVER transitions.
@@ -58,8 +59,8 @@ def aggregate_progress_rewards(
         source_frame_indices: Strictly increasing episode-local sampled rows.
         source_terminated: Optional bool terminal marker per source row.
         source_truncated: Optional bool timeout marker per source row.
-        validate_progress_range: Check that the source cumulative progress
-            change stays within the mathematical range of a predicate fraction.
+        validate_progress_range: Deprecated compatibility argument. The B1K
+            export is authoritative and no unit-range assumption is applied.
         tolerance: Numerical tolerance for the progress-range check.
     """
 
@@ -86,17 +87,9 @@ def aggregate_progress_rewards(
             done |= terminated
         if truncated is not None:
             done |= truncated
-        _validate_terminal_suffix(done)
+        _validate_terminal_suffix(done, rewards=rewards, tolerance=tolerance)
 
-    if validate_progress_range:
-        cumulative_change = np.concatenate(([0.0], np.cumsum(rewards)))
-        span = float(cumulative_change.max() - cumulative_change.min())
-        if span > 1.0 + tolerance:
-            raise ValueError(
-                "Cumulative next.reward cannot be a unit-range predicate-progress delta: "
-                f"span={span:.8f} > {1.0 + tolerance:.8f}"
-            )
-
+    del validate_progress_range
     aggregated = np.zeros(indices.size, dtype=np.float32)
     prefix = np.concatenate(([0.0], np.cumsum(rewards, dtype=np.float64)))
     starts = indices[:-1]
@@ -132,7 +125,7 @@ def _optional_bool_vector(value: Any | None, *, length: int, name: str) -> np.nd
     return np.ascontiguousarray(array)
 
 
-def _validate_terminal_suffix(done: np.ndarray) -> None:
+def _validate_terminal_suffix(done: np.ndarray, *, rewards: np.ndarray, tolerance: float) -> None:
     """Validate BEHAVIOR's terminal convention.
 
     Dataset exports may repeat ``terminated``/``truncated`` on every row of
@@ -150,4 +143,9 @@ def _validate_terminal_suffix(done: np.ndarray) -> None:
         raise ValueError(
             "Termination/truncation markers must form one contiguous suffix "
             f"starting at row {first}; got {done_positions.tolist()}"
+        )
+    if first + 1 < rewards.size and not np.allclose(rewards[first + 1 :], 0.0, rtol=0.0, atol=tolerance):
+        raise ValueError(
+            "Repeated terminal/absorbing rows must have zero recorded reward after the first terminal transition; "
+            f"nonzero suffix starts at row {first + 1}"
         )

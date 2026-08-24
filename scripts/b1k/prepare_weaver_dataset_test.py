@@ -53,6 +53,87 @@ def _load_prepare_module():
 prepare = _load_prepare_module()
 
 
+class _TaskTable:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def iterrows(self):
+        return iter(enumerate(self._rows))
+
+
+def test_episode_task_index_overrides_legacy_tasks_and_uses_official_prompt_catalog():
+    meta = types.SimpleNamespace(
+        tasks=_TaskTable(
+            [{"task_index": 7, "task_name": "official_name", "task": "Natural language prompt."}]
+        )
+    )
+    by_index, prompts = prepare._task_catalog(meta)
+    tasks = prepare._episode_tasks(
+        {"episode_index": 3, "task_index": 7, "tasks": ["stale_legacy_name"]},
+        task_names_by_index=by_index,
+    )
+    assert tasks == ("official_name",)
+    assert prompts[tasks[0]] == "Natural language prompt."
+
+
+def test_task_catalog_prefers_official_tasks_jsonl_and_cross_checks_loader_view(tmp_path):
+    meta_root = tmp_path / "meta"
+    meta_root.mkdir()
+    (meta_root / "tasks.jsonl").write_text(
+        '{"task_index": 7, "task_name": "official_name", "task": "Official instruction."}\n',
+        encoding="utf-8",
+    )
+    meta = types.SimpleNamespace(
+        tasks=_TaskTable([{"task_index": 7, "task_name": "official_name"}])
+    )
+    by_index, prompts = prepare._task_catalog(meta, tmp_path)
+    assert by_index == {7: "official_name"}
+    assert prompts == {"official_name": "Official instruction."}
+
+
+def test_task_catalog_fails_closed_when_official_prompt_is_missing(tmp_path):
+    meta_root = tmp_path / "meta"
+    meta_root.mkdir()
+    (meta_root / "tasks.jsonl").write_text(
+        '{"task_index": 7, "task_name": "official_name"}\n',
+        encoding="utf-8",
+    )
+    meta = types.SimpleNamespace(tasks=_TaskTable([{"task_index": 7, "task_name": "official_name"}]))
+    with pytest.raises(ValueError, match="lacks task_name/task natural language"):
+        prepare._task_catalog(meta, tmp_path)
+
+
+def test_metadata_hash_includes_tasks_jsonl(tmp_path):
+    meta_root = tmp_path / "meta"
+    meta_root.mkdir()
+    (meta_root / "info.json").write_text("{}", encoding="utf-8")
+    (meta_root / "tasks.jsonl").write_text("{}\n", encoding="utf-8")
+    first = prepare._metadata_sha256(tmp_path)
+    (meta_root / "tasks.jsonl").write_text('{"changed": true}\n', encoding="utf-8")
+    assert prepare._metadata_sha256(tmp_path) != first
+
+
+def test_default_task_holdout_is_deterministic_and_nonempty():
+    tasks = [f"task_{index:03d}" for index in range(100)]
+    first = prepare._deterministic_held_out_tasks(tasks, explicit=(), fraction=0.1, seed=42)
+    second = prepare._deterministic_held_out_tasks(reversed(tasks), explicit=(), fraction=0.1, seed=42)
+    assert first == second
+    assert len(first) == 10
+
+
+def test_reward_diagnostics_preserve_span_and_terminal_provenance():
+    diagnostics = prepare._reward_diagnostics(
+        np.asarray([1.0, -1.0, -1.0, 0.0]),
+        np.asarray([False, True, True, True]),
+        np.zeros(4, dtype=bool),
+        np.asarray([0, 2]),
+    )
+    assert diagnostics["cumulative_span"] == 2.0
+    assert diagnostics["first_done_row"] == 1
+    assert diagnostics["sampled_terminal_target_row"] == 2
+    assert diagnostics["post_done_max_abs_reward"] == 1.0
+
+
 def _artifact(root, episode_index: int = 0):
     states = np.zeros((2, 23), dtype=np.float32)
     episode = adapter.AdaptedEpisode(
@@ -192,7 +273,9 @@ def test_subset_resume_rejects_stale_unselected_pair_before_building_global_inde
             1: {"dataset_from_index": 2, "dataset_to_index": 4},
         },
         "episode_tasks": {0: ("resume test",), 1: ("resume test",)},
+        "episode_prompts": {0: "resume test", 1: "resume test"},
         "splits": {0: "train", 1: "train"},
+        "dataset_provenance": {},
     }
 
     # A subset rerun may select only episode 0, but startup must still audit episode 1.

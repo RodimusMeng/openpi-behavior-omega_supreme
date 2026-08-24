@@ -1,7 +1,9 @@
 # WEAVER × full B1K smoke protocol
 
 This protocol uses the complete `b1k-v3again` metadata/data path. It does not
-launch a task-specific evaluator and does not use the old radio scripts.
+launch a task-specific evaluator and does not use the old radio scripts. The
+materialized full run must use a new directory such as `numeric-full-v4`; do
+not resume or overwrite an older `numeric-full` schema.
 
 The gates are deliberately separate:
 
@@ -100,6 +102,29 @@ over each sampled interval. It is not an endpoint sample and is not silently
 treated as a RoboMeter state-progress label. Full-mode windows reserve one
 additional real successor so the terminal sentinel never reaches the frozen
 reward/critic heads.
+
+For the actual full-data preparation, use the same command without subset
+selection and write to a fresh output directory:
+
+```bash
+export NUMERIC_FULL="$WEAVER_WORK_ROOT/numeric-full-v4"
+test ! -e "$NUMERIC_FULL"
+
+uv run python scripts/b1k/prepare_weaver_dataset.py \
+  --dataset-root "$B1K_DATASET_ROOT" \
+  --output-dir "$NUMERIC_FULL" \
+  --held-out-task-fraction 0.1 \
+  --selection-seed 2026 \
+  --split-seed 42 \
+  --min-sampled-frames 10
+```
+
+The default deterministic task-level holdout is 10 of the 100 official task
+names; an explicit `--held-out-tasks` list takes precedence. The writer records
+the official `meta/tasks.jsonl` prompt catalog and hashes `info.json`,
+`tasks.jsonl`, `tasks.parquet`, and episode metadata. It rejects a dataset that
+is not the BEHAVIOR-1K v3 contract (30 Hz, 20,000 episodes, 100 tasks, R1Pro,
+23-D action, 61-D proprio).
 
 ## 3. Reproduce the released WEAVER checkpoint independently
 

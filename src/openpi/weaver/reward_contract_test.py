@@ -96,14 +96,27 @@ def test_accepts_behavior_style_long_absorbing_suffix() -> None:
     np.testing.assert_array_equal(result.transition_valid, [True, True, True, False])
 
 
-def test_rejects_endpoint_sampling_shapes_and_impossible_progress_span() -> None:
+def test_rejects_nonzero_reward_after_first_terminal_transition() -> None:
+    rewards = np.zeros(8, dtype=np.float32)
+    rewards[6] = 0.25
+    terminated = np.zeros(8, dtype=bool)
+    terminated[4:] = True
+    with pytest.raises(ValueError, match="zero recorded reward"):
+        reward_contract.aggregate_progress_rewards(
+            rewards,
+            np.asarray([0, 3, 7]),
+            source_terminated=terminated,
+        )
+
+
+def test_rejects_endpoint_sampling_shapes_but_preserves_recorded_reward_scale() -> None:
     with pytest.raises(ValueError, match="strictly increasing"):
         reward_contract.aggregate_progress_rewards(np.zeros(5), np.asarray([0, 2, 2]))
-    with pytest.raises(ValueError, match="unit-range"):
-        reward_contract.aggregate_progress_rewards(
-            np.asarray([0.7, 0.7, 0.0]),
-            np.asarray([0, 1, 2]),
-        )
+    result = reward_contract.aggregate_progress_rewards(
+        np.asarray([0.7, 0.7, 0.7]),
+        np.asarray([0, 1, 2]),
+    )
+    np.testing.assert_allclose(result.rewards, [0.7, 0.7, 0.0])
 
 
 def test_progress_can_regress_without_being_clipped() -> None:

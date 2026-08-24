@@ -27,7 +27,7 @@ from openpi.weaver.b1k_contract import B1KWeaverContract
 from openpi.weaver.b1k_contract import build_r1pro_contract
 from openpi.weaver.b1k_contract import world_model_frame_indices
 
-SCHEMA_VERSION = "b1k_weaver_episode_v3"
+SCHEMA_VERSION = "b1k_weaver_episode_v4"
 POLICY_ACTION_REPRESENTATION = "b1k_policy_mixed_v1"
 STATE_DELTA_ACTION_REPRESENTATION = "r1pro_compact_state_delta_v1"
 TRAINING_ACTION_CONTRACT = {
@@ -208,7 +208,7 @@ def angular_state_indices(contract: B1KWeaverContract | None = None) -> tuple[in
 
 
 def observed_state_delta_actions(states: np.ndarray, contract: B1KWeaverContract | None = None) -> np.ndarray:
-    """Compute observed 5 Hz state changes with shortest-angle joint deltas.
+    """Compute observed 5 Hz state changes using the official plain-delta convention.
 
     The returned array has the same length as ``states`` to match WEAVER's
     trajectory contract.  The final row is zero and must be ignored according
@@ -224,9 +224,6 @@ def observed_state_delta_actions(states: np.ndarray, contract: B1KWeaverContract
 
     actions = np.zeros_like(states)
     actions[:-1] = states[1:] - states[:-1]
-    angular_indices = angular_state_indices(contract)
-    angular_delta = actions[:-1, angular_indices]
-    actions[:-1, angular_indices] = np.arctan2(np.sin(angular_delta), np.cos(angular_delta))
     return actions
 
 
@@ -340,9 +337,32 @@ def adapt_episode(
         target_hz=target_hz,
         max_timing_error_s=max_timing_error_s,
     )
+    if terminated is not None or truncated is not None:
+        done = np.zeros(source_length, dtype=bool)
+        for value, name in ((terminated, "terminated"), (truncated, "truncated")):
+            if value is None:
+                continue
+            marker = np.asarray(value)
+            if marker.ndim == 2 and marker.shape[1] == 1:
+                marker = marker[:, 0]
+            if marker.ndim != 1 or marker.shape[0] != source_length or marker.dtype != np.bool_:
+                raise ValueError(f"{name} must be a boolean vector matching the source episode")
+            done |= marker
+        done_positions = np.flatnonzero(done)
+        if done_positions.size:
+            first_done = int(done_positions[0])
+            terminal_target = int(np.searchsorted(frame_indices, first_done + 1, side="left"))
+            if terminal_target >= frame_indices.size:
+                raise ValueError(
+                    f"Episode {episode_index} has its first terminal transition at source row {first_done}, "
+                    "but no later 5 Hz observation exists to represent its outcome"
+                )
+            frame_indices = frame_indices[: terminal_target + 1]
+            timing_errors = timing_errors[: terminal_target + 1]
     if frame_indices.size < min_sampled_frames:
         raise ValueError(
-            f"Episode {episode_index} has only {frame_indices.size} sampled frames; need {min_sampled_frames}"
+            f"Episode {episode_index} has only {frame_indices.size} sampled frames through its valid boundary; "
+            f"need {min_sampled_frames}"
         )
 
     compact_states = contract.extract_state(raw_states)[frame_indices]

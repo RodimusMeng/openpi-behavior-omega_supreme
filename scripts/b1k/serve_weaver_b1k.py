@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from collections import deque
 import dataclasses
+import hashlib
+import json
 import logging
 from pathlib import Path
 from typing import Any, Literal
@@ -28,9 +30,107 @@ from openpi.weaver import upstream_config
 from openpi.weaver import upstream_runtime
 
 LOGGER = logging.getLogger(__name__)
+TASK_PROMPT_CATALOG_SCHEMA = "behavior_task_prompts_v1"
 
 
-def _resolve_task(task: str, prompt_override: str | None, registry: dict[str, dict[str, str]]) -> tuple[str, str, str]:
+def _canonical_prompt_catalog_sha256(prompts: dict[str, str]) -> str:
+    payload = json.dumps(
+        {name: prompts[name] for name in sorted(prompts)},
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _load_task_prompt_catalog(dataset_dir: str | Path) -> dict[str, str] | None:
+    """Load the prompt catalog emitted alongside a prepared B1K dataset.
+
+    A present catalog is authoritative and therefore fails closed when its
+    schema, prompt entries, or dataset provenance are invalid.  A missing
+    catalog is allowed for backwards compatibility with old artifacts; the
+    caller may then use the small built-in registry as a fallback.
+    """
+
+    root = Path(dataset_dir).expanduser().resolve()
+    catalog_path = root / "task_prompts.json"
+    if not catalog_path.is_file():
+        return None
+    try:
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read task prompt catalog {catalog_path}: {exc}") from exc
+    if not isinstance(catalog, dict) or catalog.get("schema_version") != TASK_PROMPT_CATALOG_SCHEMA:
+        raise ValueError(
+            f"Unsupported task prompt catalog schema in {catalog_path}: "
+            f"{catalog.get('schema_version') if isinstance(catalog, dict) else None!r}"
+        )
+
+    dataset_hash = catalog.get("dataset_metadata_sha256")
+    if not isinstance(dataset_hash, str) or len(dataset_hash) != 64:
+        raise ValueError(f"Task prompt catalog has invalid dataset_metadata_sha256: {catalog_path}")
+    try:
+        int(dataset_hash, 16)
+    except ValueError as exc:
+        raise ValueError(f"Task prompt catalog has invalid dataset_metadata_sha256: {catalog_path}") from exc
+
+    summary_path = root / "summary.json"
+    if not summary_path.is_file():
+        raise ValueError(f"Task prompt catalog requires sibling summary.json: {summary_path}")
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read dataset summary {summary_path}: {exc}") from exc
+    summary_hash = summary.get("dataset_metadata_sha256") if isinstance(summary, dict) else None
+    if summary_hash != dataset_hash:
+        raise ValueError(
+            "Task prompt catalog dataset hash does not match summary.json: "
+            f"catalog={dataset_hash!r}, summary={summary_hash!r}"
+        )
+
+    prompts = catalog.get("prompts")
+    if not isinstance(prompts, dict) or not prompts:
+        raise ValueError(f"Task prompt catalog has no prompts mapping: {catalog_path}")
+    normalized: dict[str, str] = {}
+    for raw_name, raw_prompt in prompts.items():
+        name = str(raw_name).strip()
+        if name.startswith("b1k/"):
+            name = name.split("/", 1)[1].strip()
+        prompt = raw_prompt.strip() if isinstance(raw_prompt, str) else ""
+        if not name or "/" in name or not prompt:
+            raise ValueError(f"Invalid task prompt catalog entry {raw_name!r}: {catalog_path}")
+        if name in normalized and normalized[name] != prompt:
+            raise ValueError(f"Conflicting prompt catalog entries for task {name!r}: {catalog_path}")
+        normalized[name] = prompt
+    catalog_hash = catalog.get("task_catalog_sha256")
+    if not isinstance(catalog_hash, str) or len(catalog_hash) != 64:
+        raise ValueError(f"Task prompt catalog has invalid task_catalog_sha256: {catalog_path}")
+    try:
+        int(catalog_hash, 16)
+    except ValueError as exc:
+        raise ValueError(f"Task prompt catalog has invalid task_catalog_sha256: {catalog_path}") from exc
+    if catalog_hash != _canonical_prompt_catalog_sha256(normalized):
+        raise ValueError(f"Task prompt catalog task_catalog_sha256 does not match prompts: {catalog_path}")
+    provenance = summary.get("dataset_provenance") if isinstance(summary, dict) else None
+    summary_catalog_hash = provenance.get("task_catalog_sha256") if isinstance(provenance, dict) else None
+    legacy_catalog = summary.get("task_catalog") if isinstance(summary, dict) else None
+    if summary_catalog_hash is None and isinstance(legacy_catalog, dict):
+        summary_catalog_hash = legacy_catalog.get("sha256")
+    if summary_catalog_hash != catalog_hash:
+        raise ValueError(
+            "Task prompt catalog task hash does not match summary.json: "
+            f"catalog={catalog_hash!r}, summary={summary_catalog_hash!r}"
+        )
+    return normalized
+
+
+def _resolve_task(
+    task: str,
+    prompt_override: str | None,
+    registry: dict[str, dict[str, str]],
+    prompt_catalog: dict[str, str] | None = None,
+) -> tuple[str, str, str]:
     task_value = str(task).strip()
     if not task_value:
         raise ValueError("--task must be a non-empty task name or 'bucket/name'")
@@ -45,6 +145,10 @@ def _resolve_task(task: str, prompt_override: str | None, registry: dict[str, di
         if not prompt:
             raise ValueError("--prompt must be non-empty when supplied")
         return task_bucket, task_name, prompt
+    if task_bucket == "b1k" and prompt_catalog is not None:
+        prompt = prompt_catalog.get(task_name)
+        if prompt is not None:
+            return task_bucket, task_name, prompt
     try:
         return task_bucket, task_name, registry[task_bucket][task_name]
     except KeyError as exc:
@@ -360,7 +464,13 @@ def main(args: Args) -> None:
         raise ValueError(f"Required WEAVER serving paths are empty: {empty_paths}")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("WEAVER serving requested CUDA but torch.cuda.is_available() is false")
-    task_bucket, task_name, prompt = _resolve_task(args.task, args.prompt, TASK_REGISTRY)
+    prompt_catalog = _load_task_prompt_catalog(args.dataset_dir)
+    task_bucket, task_name, prompt = _resolve_task(
+        args.task,
+        args.prompt,
+        TASK_REGISTRY,
+        prompt_catalog,
+    )
     raw_config = yaml.safe_load(Path(args.weaver_config).expanduser().resolve().read_text(encoding="utf-8"))
     config, _ = upstream_config.build_behavior_config(raw_config, dataset_root=args.dataset_dir,
                                                        norm_stats_path=args.norm_stats, dynamics_only=False)

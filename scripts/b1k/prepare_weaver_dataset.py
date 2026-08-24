@@ -1,11 +1,11 @@
 """Prepare episode-level numeric artifacts from the full B1K LeRobot dataset.
 
 This is the first half of the WEAVER dataset path. It does not encode SD3
-latents. B1K ``next.reward`` is a 30 Hz transition-aligned BehaviorTask
-predicate-progress delta; it is summed over every half-open source-row interval
-between two 5 Hz frames. Endpoint sampling is never used. Each output episode
-contains the complete numeric training contract and enough provenance for later
-caches to reject stale or incompatible artifacts.
+latents. B1K ``next.reward`` is treated as the transition-aligned value recorded
+by the released demonstration export; it is summed over every half-open
+source-row interval between two 5 Hz frames. Endpoint sampling is never used.
+Each output episode contains the complete numeric training contract and enough
+provenance for later caches to reject stale or incompatible artifacts.
 """
 
 from __future__ import annotations
@@ -67,6 +67,8 @@ class Args:
     val_fraction: float = 0.1
     split_seed: int = 42
     held_out_tasks: tuple[str, ...] = ()
+    held_out_task_fraction: float = 0.1
+    expected_metadata_sha256: str | None = None
     include_depth: bool = False
     dry_run: bool = False
     fail_fast: bool = True
@@ -105,20 +107,80 @@ def _normalize_task_list(value: Any) -> tuple[str, ...]:
     return tuple(task.strip() for task in tasks if task.strip())
 
 
-def _episode_tasks(meta: Any, episode: dict[str, Any]) -> tuple[str, ...]:
-    tasks = _normalize_task_list(episode.get("tasks"))
-    if tasks:
-        return tasks
+def _task_catalog(meta: Any, dataset_root: Path | None = None) -> tuple[dict[int, str], dict[str, str]]:
+    """Resolve the official B1K task index/name/prompt catalog.
 
+    The released bundle carries the authoritative three-column catalog in
+    ``meta/tasks.jsonl``.  ``dataset.meta.tasks`` is still accepted as a
+    compatibility fallback because generic LeRobot loaders commonly expose a
+    DataFrame indexed by task name with only ``task_index`` retained.
+    """
+
+    rows: list[tuple[Any, dict[str, Any]]] = []
+    jsonl_path = (dataset_root / "meta" / "tasks.jsonl") if dataset_root is not None else None
+    if jsonl_path is not None and jsonl_path.is_file():
+        for line_number, line in enumerate(jsonl_path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid task metadata JSON at {jsonl_path}:{line_number}") from exc
+            if not isinstance(row, dict):
+                raise ValueError(f"Task metadata row {line_number} is not an object: {jsonl_path}")
+            rows.append((line_number, row))
+        if not rows:
+            raise ValueError(f"Official task metadata is empty: {jsonl_path}")
+    else:
+        for row_index, row in meta.tasks.iterrows():
+            rows.append((row_index, dict(row)))
+
+    by_index: dict[int, str] = {}
+    prompts: dict[str, str] = {}
+    for row_index, row in rows:
+        task_index = int(row["task_index"]) if "task_index" in row else row_index
+        task_name = str(row.get("task_name", row_index)).strip()
+        prompt = str(row.get("task", "")).strip()
+        if not task_name or not prompt:
+            raise ValueError(f"Task metadata row {row_index!r} lacks task_name/task natural language")
+        if task_index in by_index or task_name in prompts:
+            raise ValueError(f"Duplicate task metadata entry: index={task_index}, name={task_name!r}")
+        by_index[task_index] = task_name
+        prompts[task_name] = prompt
+
+    # Cross-check the loader's task index/name view when the JSONL catalog is
+    # available.  Prompts are intentionally not required from the DataFrame:
+    # LeRobot may discard that column while loading metadata.
+    if jsonl_path is not None and jsonl_path.is_file() and hasattr(meta, "tasks"):
+        frame_mapping: dict[int, str] = {}
+        for row_index, row in meta.tasks.iterrows():
+            row_values = dict(row)
+            index = int(row_values.get("task_index", row_index))
+            name = str(row_values.get("task_name", row_index)).strip()
+            if index in frame_mapping and frame_mapping[index] != name:
+                raise ValueError(f"Loader task metadata disagrees internally at task_index={index}")
+            frame_mapping[index] = name
+        if frame_mapping and frame_mapping != by_index:
+            raise ValueError("dataset.meta.tasks task_index/task_name mapping disagrees with meta/tasks.jsonl")
+    return by_index, prompts
+
+
+def _episode_tasks(episode: dict[str, Any], *, task_names_by_index: dict[int, str]) -> tuple[str, ...]:
     if "task_index" not in episode:
+        tasks = _normalize_task_list(episode.get("tasks"))
+        unknown = set(tasks) - set(task_names_by_index.values())
+        if unknown:
+            raise ValueError(f"Episode {episode.get('episode_index')} names unknown tasks: {sorted(unknown)}")
+        if tasks:
+            return tasks
         raise ValueError(f"Episode {episode.get('episode_index')} has neither tasks nor task_index metadata")
     task_indices = np.asarray(episode["task_index"]).reshape(-1)
     resolved: list[str] = []
     for task_index in task_indices:
-        matches = meta.tasks[meta.tasks["task_index"] == int(task_index)]
-        if len(matches) != 1:
+        task_name = task_names_by_index.get(int(task_index))
+        if task_name is None:
             raise ValueError(f"Could not resolve task_index={task_index} for episode {episode.get('episode_index')}")
-        resolved.append(str(matches.index[0]))
+        resolved.append(task_name)
     return _normalize_task_list(resolved)
 
 
@@ -130,7 +192,8 @@ def _metadata_sha256(dataset_root: Path) -> str:
     files = sorted(
         path
         for path in meta_root.rglob("*")
-        if path.is_file() and (path.name in {"info.json", "tasks.parquet"} or "episodes" in path.parts)
+        if path.is_file()
+        and (path.name in {"info.json", "tasks.jsonl", "tasks.parquet"} or "episodes" in path.parts)
     )
     digest = hashlib.sha256()
     for path in files:
@@ -141,6 +204,129 @@ def _metadata_sha256(dataset_root: Path) -> str:
             while chunk := stream.read(1024 * 1024):
                 digest.update(chunk)
     return digest.hexdigest()
+
+
+def _canonical_sha256(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _dataset_preflight(
+    dataset_root: Path,
+    dataset: Any,
+    *,
+    task_names_by_index: dict[int, str],
+    task_prompts: dict[str, str],
+) -> dict[str, Any]:
+    info_path = dataset_root / "meta" / "info.json"
+    try:
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read official B1K info.json: {info_path}: {exc}") from exc
+    if not isinstance(info, dict):
+        raise ValueError("Official B1K info.json must contain an object")
+
+    expected_scalars = {
+        "fps": 30,
+        "total_episodes": 20_000,
+        "total_tasks": 100,
+        "robot_type": "R1Pro",
+    }
+    for field, expected in expected_scalars.items():
+        if info.get(field) != expected:
+            raise ValueError(f"Official B1K metadata requires {field}={expected!r}, got {info.get(field)!r}")
+    if int(dataset.num_episodes) != 20_000:
+        raise ValueError(f"Loaded B1K dataset must expose 20000 episodes, got {dataset.num_episodes!r}")
+    if len(task_names_by_index) != 100 or len(task_prompts) != 100:
+        raise ValueError(
+            f"Official B1K task catalog must contain 100 unique task IDs and prompts, "
+            f"got {len(task_names_by_index)} / {len(task_prompts)}"
+        )
+
+    features = info.get("features")
+    if not isinstance(features, dict):
+        raise ValueError("Official B1K info.json has no features mapping")
+    for key, expected_dim in (("action", 23), ("observation.state", 61)):
+        feature = features.get(key)
+        shape = feature.get("shape") if isinstance(feature, dict) else None
+        if shape != [expected_dim]:
+            raise ValueError(f"Official B1K feature {key!r} must have shape [{expected_dim}], got {shape!r}")
+
+    catalog = {name: task_prompts[name] for name in sorted(task_prompts)}
+    return {
+        "codebase_version": str(info.get("codebase_version", "unknown")),
+        "info_sha256": _file_sha256(info_path),
+        "task_catalog_sha256": _canonical_sha256(catalog),
+        "total_frames": int(info.get("total_frames", 0)),
+        "total_episodes": 20_000,
+        "total_tasks": 100,
+        "robot_type": "R1Pro",
+        "source_fps": 30,
+        "state_dim": 61,
+        "action_dim": 23,
+    }
+
+
+def _deterministic_held_out_tasks(
+    task_names: Any,
+    *,
+    explicit: tuple[str, ...],
+    fraction: float,
+    seed: int,
+) -> tuple[str, ...]:
+    names = tuple(sorted({str(name) for name in task_names}))
+    if explicit:
+        unknown = set(explicit) - set(names)
+        if unknown:
+            raise ValueError(f"Unknown held_out_tasks: {sorted(unknown)}")
+        return tuple(sorted(set(explicit)))
+    if not math.isfinite(fraction) or not 0.0 < fraction < 1.0:
+        raise ValueError(f"held_out_task_fraction must be finite and in (0,1), got {fraction!r}")
+    count = max(1, round(len(names) * fraction))
+    ordered = sorted(names, key=lambda name: hashlib.sha256(f"{seed}:held-out:{name}".encode()).digest())
+    return tuple(sorted(ordered[:count]))
+
+
+def _reward_diagnostics(
+    rewards: np.ndarray,
+    terminated: np.ndarray,
+    truncated: np.ndarray,
+    sampled_frame_indices: np.ndarray,
+) -> dict[str, Any]:
+    values = np.asarray(rewards, dtype=np.float64).reshape(-1)
+    term = np.asarray(terminated, dtype=bool).reshape(-1)
+    trunc = np.asarray(truncated, dtype=bool).reshape(-1)
+    done = term | trunc
+    done_positions = np.flatnonzero(done)
+    first_done = int(done_positions[0]) if done_positions.size else None
+    first_term = int(np.flatnonzero(term)[0]) if np.any(term) else None
+    first_trunc = int(np.flatnonzero(trunc)[0]) if np.any(trunc) else None
+    cumulative = np.concatenate(([0.0], np.cumsum(values, dtype=np.float64)))
+    terminal_target = None
+    if first_done is not None:
+        target = int(np.searchsorted(sampled_frame_indices, first_done + 1, side="left"))
+        terminal_target = int(sampled_frame_indices[target]) if target < len(sampled_frame_indices) else None
+    # The transition at the final sampled observation has no sampled successor,
+    # so it is part of the unrepresentable tail as well.
+    tail_start = int(sampled_frame_indices[-1]) if len(sampled_frame_indices) else len(values)
+    tail = values[tail_start:]
+    return {
+        "source_reward_min": float(values.min()) if values.size else 0.0,
+        "source_reward_max": float(values.max()) if values.size else 0.0,
+        "source_reward_sum": float(values.sum()),
+        "source_reward_nonzero_count": int(np.count_nonzero(values)),
+        "cumulative_span": float(cumulative.max() - cumulative.min()),
+        "first_terminated_row": first_term,
+        "first_truncated_row": first_trunc,
+        "first_done_row": first_done,
+        "post_done_max_abs_reward": float(np.max(np.abs(values[first_done + 1 :]), initial=0.0))
+        if first_done is not None
+        else 0.0,
+        "sampled_terminal_target_row": terminal_target,
+        "unsampled_tail_count": int(tail.size),
+        "unsampled_tail_reward_sum": float(tail.sum()),
+        "unsampled_tail_reward_max_abs": float(np.max(np.abs(tail), initial=0.0)),
+    }
 
 
 def _atomic_write_json(path: Path, value: Any) -> None:
@@ -244,7 +430,7 @@ def _validate_existing_pair(
     if expected_manifest is not None:
         if manifest.get("semantic_sha256") != expected_manifest.get("semantic_sha256"):
             raise ArtifactResumeError(f"Existing episode semantics do not match current source/config: {json_path}")
-        for field in ("source", "task_names"):
+        for field in ("source", "task_names", "prompt_source", "dataset_provenance", "reward_diagnostics"):
             if manifest.get(field) != expected_manifest.get(field):
                 raise ArtifactResumeError(f"Existing episode {field} is stale: {json_path}")
         expected_artifact = expected_manifest["numeric_artifact"]
@@ -296,7 +482,9 @@ def _validate_existing_context(
     source_fps: float,
     all_episode_rows: dict[int, dict[str, Any]],
     episode_tasks: dict[int, tuple[str, ...]],
+    episode_prompts: dict[int, str],
     splits: dict[int, str],
+    dataset_provenance: dict[str, Any],
 ) -> None:
     """Reject every existing pair that is not part of the current dataset run."""
 
@@ -314,8 +502,9 @@ def _validate_existing_context(
         "online_steering": _adapter.ONLINE_STEERING_CONTRACT,
         "reward": _reward_contract.REWARD_CONTRACT,
         "reward_available": True,
-        "prompt": episode_tasks[episode_index][0],
+        "prompt": episode_prompts[episode_index],
         "split": splits[episode_index],
+        "dataset_provenance": dataset_provenance,
     }
     for field, expected in current_contract.items():
         if manifest.get(field) != expected:
@@ -425,24 +614,46 @@ def main(args: Args) -> None:
     if missing_numeric_features:
         raise KeyError(f"B1K dataset is missing required WEAVER numeric features: {sorted(missing_numeric_features)}")
     metadata_sha256 = _metadata_sha256(dataset_root)
+    if args.expected_metadata_sha256 is not None and metadata_sha256 != args.expected_metadata_sha256:
+        raise ValueError(
+            "Dataset metadata SHA-256 does not match --expected-metadata-sha256: "
+            f"expected={args.expected_metadata_sha256}, actual={metadata_sha256}"
+        )
     if not math.isclose(float(dataset.fps), 30.0, rel_tol=0.0, abs_tol=1e-9):
         raise ValueError(f"B1K WEAVER source contract requires 30 Hz data, got fps={dataset.fps!r}")
 
+    task_names_by_index, task_prompts = _task_catalog(dataset.meta, dataset_root)
+    dataset_provenance = _dataset_preflight(
+        dataset_root,
+        dataset,
+        task_names_by_index=task_names_by_index,
+        task_prompts=task_prompts,
+    )
     all_episode_rows: dict[int, dict[str, Any]] = {}
     episode_tasks: dict[int, tuple[str, ...]] = {}
+    episode_prompts: dict[int, str] = {}
     for position in range(len(dataset.meta.episodes)):
         row = dict(dataset.meta.episodes[position])
         episode_index = int(_scalar(row["episode_index"]))
         if episode_index in all_episode_rows:
             raise ValueError(f"Duplicate episode_index in metadata: {episode_index}")
         all_episode_rows[episode_index] = row
-        episode_tasks[episode_index] = _episode_tasks(dataset.meta, row)
+        episode_tasks[episode_index] = _episode_tasks(row, task_names_by_index=task_names_by_index)
+        if len(episode_tasks[episode_index]) != 1:
+            raise ValueError(f"Episode {episode_index} must resolve to exactly one task")
+        episode_prompts[episode_index] = task_prompts[episode_tasks[episode_index][0]]
 
+    held_out_tasks = _deterministic_held_out_tasks(
+        task_prompts,
+        explicit=args.held_out_tasks,
+        fraction=args.held_out_task_fraction,
+        seed=args.split_seed,
+    )
     splits = _adapter.deterministic_episode_split(
         episode_tasks,
         val_fraction=args.val_fraction,
         seed=args.split_seed,
-        held_out_tasks=args.held_out_tasks,
+        held_out_tasks=held_out_tasks,
     )
     selected_indices = sorted(all_episode_rows)
     if args.episode_indices is not None and args.sample_tasks is not None:
@@ -500,6 +711,8 @@ def main(args: Args) -> None:
                 "total_episodes": dataset.num_episodes,
                 "selected_episodes": len(selected_indices),
                 "selected_tasks": sorted({episode_tasks[index][0] for index in selected_indices}),
+                "held_out_tasks": list(held_out_tasks),
+                "dataset_provenance": dataset_provenance,
                 "selected_video_features": selected_features,
                 "target_hz": args.target_hz,
                 "output_dir": str(output_root),
@@ -521,7 +734,9 @@ def main(args: Args) -> None:
             source_fps=float(dataset.fps),
             all_episode_rows=all_episode_rows,
             episode_tasks=episode_tasks,
+            episode_prompts=episode_prompts,
             splits=splits,
+            dataset_provenance=dataset_provenance,
         )
     manifest_index = {episode_index: pair[0] for episode_index, pair in existing_pairs.items()}
     manifests: list[dict[str, Any]] = []
@@ -557,7 +772,7 @@ def main(args: Args) -> None:
             )
             adapted = _adapter.adapt_episode(
                 episode_index=episode_index,
-                prompt=episode_tasks[episode_index][0],
+                prompt=episode_prompts[episode_index],
                 timestamps_s=timestamps,
                 raw_states=raw_states,
                 policy_actions=policy_actions,
@@ -568,6 +783,17 @@ def main(args: Args) -> None:
                 min_sampled_frames=args.min_sampled_frames,
                 contract=contract,
             )
+            reward_diagnostics = _reward_diagnostics(
+                source_rewards,
+                source_terminated,
+                source_truncated,
+                adapted.source_frame_indices,
+            )
+            if reward_diagnostics["unsampled_tail_reward_max_abs"] > 1e-5:
+                raise ValueError(
+                    "Nonzero recorded reward exists after the last valid 5 Hz observation target: "
+                    f"{reward_diagnostics}"
+                )
             split = splits[episode_index]
             manifest = _adapter.episode_manifest(
                 adapted,
@@ -597,6 +823,9 @@ def main(args: Args) -> None:
                         "raw_state_dim": int(raw_states.shape[-1]),
                     },
                     "task_names": list(episode_tasks[episode_index]),
+                    "prompt_source": "official_meta_tasks_catalog",
+                    "dataset_provenance": dataset_provenance,
+                    "reward_diagnostics": reward_diagnostics,
                     "numeric_artifact": {"complete": True},
                     "latent_artifact": {"complete": False},
                 }
@@ -688,6 +917,13 @@ def main(args: Args) -> None:
         "schema_version": _adapter.SCHEMA_VERSION,
         "dataset_repo_id": data_factory.repo_id,
         "dataset_metadata_sha256": metadata_sha256,
+        "dataset_provenance": dataset_provenance,
+        "task_catalog": {
+            "schema_version": "behavior_tasks_v1",
+            "sha256": dataset_provenance["task_catalog_sha256"],
+            "count": len(task_prompts),
+        },
+        "held_out_tasks": list(held_out_tasks),
         "target_hz": args.target_hz,
         "selected_video_features": list(selected_features),
         "processed": len(manifests),
@@ -700,6 +936,15 @@ def main(args: Args) -> None:
         "online_steering": "disabled_offline_state_delta_is_noncausal",
     }
     if not args.dry_run:
+        _atomic_write_json(
+            output_root / "task_prompts.json",
+            {
+                "schema_version": "behavior_task_prompts_v1",
+                "dataset_metadata_sha256": metadata_sha256,
+                "task_catalog_sha256": dataset_provenance["task_catalog_sha256"],
+                "prompts": {name: task_prompts[name] for name in sorted(task_prompts)},
+            },
+        )
         _atomic_write_json(output_root / "summary.json", summary)
         _atomic_write_manifest_index(output_root / "manifest.jsonl", manifest_index)
     print(json.dumps(summary, indent=2, ensure_ascii=False), flush=True)
