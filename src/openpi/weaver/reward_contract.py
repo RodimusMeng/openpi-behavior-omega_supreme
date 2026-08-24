@@ -23,6 +23,7 @@ REWARD_CONTRACT = {
     "state_aligned": False,
     "transition_aligned": True,
     "terminal_row_valid": False,
+    "terminal_marker_semantics": "optional_absorbing_suffix",
     "privileged_offline_label": True,
     "allowed_online_input": False,
 }
@@ -85,12 +86,7 @@ def aggregate_progress_rewards(
             done |= terminated
         if truncated is not None:
             done |= truncated
-        done_positions = np.flatnonzero(done)
-        if done_positions.size > 1 or (done_positions.size == 1 and done_positions[0] != rewards.size - 1):
-            raise ValueError(
-                "An episode may contain at most one termination/truncation marker and it must be on the final row; "
-                f"got {done_positions.tolist()}"
-            )
+        _validate_terminal_suffix(done)
 
     if validate_progress_range:
         cumulative_change = np.concatenate(([0.0], np.cumsum(rewards)))
@@ -134,3 +130,24 @@ def _optional_bool_vector(value: Any | None, *, length: int, name: str) -> np.nd
     if array.ndim != 1 or array.dtype != np.bool_ or array.shape[0] != length:
         raise ValueError(f"{name} must be a boolean ({length},) or ({length},1) array, got {array.shape}/{array.dtype}")
     return np.ascontiguousarray(array)
+
+
+def _validate_terminal_suffix(done: np.ndarray) -> None:
+    """Validate BEHAVIOR's terminal convention.
+
+    Dataset exports may repeat ``terminated``/``truncated`` on every row of
+    the absorbing suffix after the task finishes.  This is equivalent to a
+    single terminal event for transition alignment.  We accept no marker, a
+    final-row pulse, or one contiguous suffix, while rejecting markers that
+    resume or contain multiple separated regions.
+    """
+
+    done_positions = np.flatnonzero(done)
+    if done_positions.size == 0:
+        return
+    first = int(done_positions[0])
+    if not np.all(done[first:]):
+        raise ValueError(
+            "Termination/truncation markers must form one contiguous suffix "
+            f"starting at row {first}; got {done_positions.tolist()}"
+        )
