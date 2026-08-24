@@ -81,6 +81,26 @@ def test_state_update_wraps_only_audited_joint_position_coordinates():
     assert result[0, 0] == pytest.approx(4 * np.pi + 0.25)
 
 
+def test_state_delta_and_update_use_shortest_angle_across_pi_boundary():
+    angular = b1k_dataset_adapter.angular_state_indices()
+    before = np.zeros((2, 23), dtype=np.float32)
+    before[0, angular] = np.pi - 0.05
+    before[1, angular] = -np.pi + 0.05
+
+    deltas = b1k_dataset_adapter.observed_state_delta_actions(before)
+    np.testing.assert_allclose(deltas[0, angular], 0.1, atol=1e-6)
+    updated = adapter.apply_state_delta(before[0], deltas[0])
+    angular_array = np.asarray(angular)
+    np.testing.assert_allclose(updated[angular_array], before[1, angular_array], atol=1e-6)
+
+
+def test_fixed_rate_candidate_horizon_is_checked_before_rollout():
+    assert adapter.available_world_model_horizon(32, control_hz=30, target_hz=5) == 5
+    assert adapter.require_world_model_horizon(32, 5, control_hz=30, target_hz=5) == 5
+    with pytest.raises(ValueError, match=r"provides 5 complete intervals.*required=8"):
+        adapter.require_world_model_horizon(32, 8, control_hz=30, target_hz=5)
+
+
 def test_adapter_sample_rejects_nonpositive_command_duration():
     with pytest.raises(ValueError, match="positive"):
         adapter.AdapterSample(

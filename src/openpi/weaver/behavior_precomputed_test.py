@@ -166,10 +166,16 @@ def _write_index(root: Path, manifests: list[dict]) -> None:
 
 
 def _write_norm(root: Path) -> None:
+    manifest_sha = _sha256(root / "manifest.jsonl")
     (root / "norm_stats.json").write_text(
         json.dumps(
             {
                 "schema_version": behavior_precomputed.NORM_SCHEMA_VERSION,
+                "dataset": {"repo_id": "b1k-v3again", "metadata_sha256": "a" * 64},
+                "source_split": "train",
+                "target_hz": 5.0,
+                "train_manifest_sha256": manifest_sha,
+                "episode_count": 1,
                 "norm_stats": {
                     "state": {
                         "representation": "r1pro_compact_state_v1",
@@ -186,6 +192,25 @@ def _write_norm(root: Path) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def test_norm_stats_provenance_must_match_manifest_dataset_and_rate(tmp_path):
+    manifest = _write_episode(tmp_path, _episode(0))
+    _write_index(tmp_path, [manifest])
+    _write_norm(tmp_path)
+    norm_path = tmp_path / "norm_stats.json"
+    value = json.loads(norm_path.read_text(encoding="utf-8"))
+    value["train_manifest_sha256"] = "f" * 64
+    norm_path.write_text(json.dumps(value), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="different manifest index"):
+        behavior_precomputed.BehaviorPrecomputed(
+            tmp_path,
+            horizon=3,
+            n_history=2,
+            normalize=True,
+            reward_mode="disabled",
+        )
 
 
 def test_dynamics_batch_matches_weaver_contract_without_fake_rewards(tmp_path):

@@ -113,6 +113,9 @@ def run(
     if args.split != "train":
         raise ValueError("WEAVER production training is train-split only; held-out val/test are evaluation-only")
     lineage = _dataset_lineage(dataset, split=args.split)
+    norm_provenance = getattr(dataset, "norm_stats_provenance", None)
+    if not isinstance(norm_provenance, Mapping):
+        raise ValueError("Normalized WEAVER training requires auditable norm_stats provenance")
 
     training_cfg = config["training"]
     batch_size = int(training_cfg["batch_size"])
@@ -137,6 +140,13 @@ def run(
             f"Refusing to overwrite an existing training checkpoint without --resume: {output_checkpoint}"
         )
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.resume:
+        _assert_resume_contract(
+            output_dir,
+            config=config,
+            lineage=lineage,
+            norm_provenance=norm_provenance,
+        )
     model = build_model(config, device=args.device)
     load_dir = output_dir if args.resume else Path(args.pretrained_dir).expanduser().resolve()
     load_mode = "resume" if args.resume else "b1k_23d_fresh"
@@ -160,20 +170,27 @@ def run(
         device=args.device,
     )
     start_step = 0
+    checkpoint_load_report = load_result.report.to_dict()
     if load_result.resumed:
         start_step = training_runtime.restore_optimizer_for_resume(optimizer, load_result.checkpoint)
     elif "optimizer" in load_result.checkpoint or "step" in load_result.checkpoint:
         raise ValueError("Fresh 8-D to 23-D transfer must not expose source optimizer or step")
+    # The upstream loader intentionally keeps optimizer tensors on CPU. Once
+    # restore_optimizer_for_resume has copied them into the target optimizer,
+    # clear the source mapping before model training to avoid a duplicate copy.
+    if isinstance(load_result.checkpoint, dict):
+        load_result.checkpoint.clear()
 
     model = _apply_upstream_wrappers(model, config, torch=torch)
     loop = _loop_config(config, args)
     tools = upstream_tools or training_runtime.load_upstream_tools()
     transfer_payload = {
         "config_transfer": dataclasses.asdict(config_report),
-        "checkpoint_load": load_result.report.to_dict(),
+        "checkpoint_load": checkpoint_load_report,
         "training_mode": args.mode,
         "resume": bool(args.resume),
         "dataset_lineage": lineage,
+        "norm_stats_provenance": norm_provenance,
     }
     _atomic_write_json(output_dir / "initialization_report.json", transfer_payload)
     result = training_runtime.train(
@@ -183,7 +200,11 @@ def run(
         loop=loop,
         upstream=tools,
         checkpoint_dir=output_dir,
-        saved_config={**config, "weaver_lineage": lineage},
+        saved_config={
+            **config,
+            "weaver_lineage": lineage,
+            "weaver_norm_provenance": norm_provenance,
+        },
         start_step=start_step,
     )
     summary = {
@@ -192,6 +213,7 @@ def run(
         "mode": args.mode,
         "split": args.split,
         "dataset_lineage": lineage,
+        "norm_stats_provenance": norm_provenance,
         "tiny_overfit_batches": args.tiny_overfit_batches,
         "tiny_overfit_steps": args.tiny_overfit_steps,
         "last_step": dataclasses.asdict(result.reports[-1]) if result.reports else None,
@@ -223,6 +245,64 @@ def _dataset_lineage(dataset: Any, *, split: str) -> dict[str, Any]:
         "episode_indices": episodes,
         "semantic_sha256": semantic,
     }
+
+
+def _assert_resume_contract(
+    output_dir: Path,
+    *,
+    config: Mapping[str, Any],
+    lineage: Mapping[str, Any],
+    norm_provenance: Mapping[str, Any],
+) -> None:
+    """Reject resume when saved data/model/optimizer semantics changed."""
+
+    config_path = output_dir / "config.yaml"
+    if not config_path.is_file():
+        raise ValueError(f"Resume checkpoint is missing its saved config: {config_path}")
+    try:
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise ValueError(f"Could not read resume config {config_path}: {exc}") from exc
+    if not isinstance(saved, Mapping):
+        raise ValueError(f"Resume config must contain a mapping: {config_path}")
+
+    saved_lineage = saved.get("weaver_lineage")
+    if _canonical(saved_lineage) != _canonical(lineage):
+        raise ValueError("Resume dataset lineage differs from the saved checkpoint")
+    saved_norm = saved.get("weaver_norm_provenance")
+    if _canonical_provenance(saved_norm) != _canonical_provenance(norm_provenance):
+        raise ValueError("Resume normalization provenance differs from the saved checkpoint")
+
+    saved_config = {key: value for key, value in saved.items() if key not in {"weaver_lineage", "weaver_norm_provenance"}}
+    if _canonical_config(saved_config) != _canonical_config(config):
+        raise ValueError("Resume configuration differs from the saved checkpoint config")
+
+
+def _canonical(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _canonical(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
+    if isinstance(value, (list, tuple)):
+        return [_canonical(item) for item in value]
+    return value
+
+
+def _canonical_config(value: Mapping[str, Any]) -> Any:
+    normalized = copy.deepcopy(dict(value))
+    dataset = normalized.get("dataset")
+    if isinstance(dataset, dict):
+        # Absolute paths legitimately differ when a checkpoint is moved to the
+        # GPU host; lineage and norm hashes above prove the underlying data.
+        dataset.pop("path", None)
+        dataset.pop("norm_stats_path", None)
+    return _canonical(normalized)
+
+
+def _canonical_provenance(value: Any) -> Any:
+    if not isinstance(value, Mapping):
+        return None
+    normalized = dict(value)
+    normalized.pop("path", None)
+    return _canonical(normalized)
 
 
 def _loop_config(config: Mapping[str, Any], args: argparse.Namespace) -> training_runtime.LoopConfig:

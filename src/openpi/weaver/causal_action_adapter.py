@@ -337,6 +337,16 @@ def build_torch_model(spec: AdapterSpec) -> Any:
                 raise ValueError("duration/mask must match the policy-action batch/time axes")
             if mask.dtype != torch.bool or not bool(mask.any(dim=1).all()):
                 raise ValueError("every adapter sample must contain at least one valid command")
+            lengths = mask.sum(dim=1)
+            prefix = torch.arange(mask.shape[1], device=mask.device).unsqueeze(0) < lengths.unsqueeze(1)
+            if not torch.equal(mask, prefix):
+                raise ValueError("adapter command mask must be a contiguous left-aligned prefix")
+            if not bool(torch.isfinite(action_durations_s).all()):
+                raise ValueError("action_durations_s must contain only finite values")
+            if not bool((action_durations_s[mask] > 0).all()):
+                raise ValueError("valid action durations must be strictly positive")
+            if bool((action_durations_s[~mask] != 0).any()):
+                raise ValueError("padded action durations must be exactly zero")
             sequence = torch.cat([policy_actions, action_durations_s.unsqueeze(-1)], dim=-1)
             packed = torch.nn.utils.rnn.pack_padded_sequence(
                 sequence,
@@ -434,6 +444,47 @@ def segment_candidate_actions(
             durations[:, wm_index, step] = duration
             mask[:, wm_index, step] = True
     return SegmentedCandidates(output, durations, mask, wm_edges)
+
+
+def available_world_model_horizon(
+    action_horizon: int,
+    *,
+    control_hz: float = 30.0,
+    target_hz: float = 5.0,
+) -> int:
+    """Return complete WM intervals covered by a fixed-rate policy chunk."""
+
+    if isinstance(action_horizon, bool) or not isinstance(action_horizon, int) or action_horizon <= 0:
+        raise ValueError("action_horizon must be a positive integer")
+    for name, value in (("control_hz", control_hz), ("target_hz", target_hz)):
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be finite and positive")
+    return math.floor((action_horizon / control_hz + 1e-9) * target_hz)
+
+
+def require_world_model_horizon(
+    action_horizon: int,
+    required_horizon: int,
+    *,
+    control_hz: float = 30.0,
+    target_hz: float = 5.0,
+) -> int:
+    """Fail before policy inference when a chunk cannot cover a WM rollout."""
+
+    if isinstance(required_horizon, bool) or not isinstance(required_horizon, int) or required_horizon <= 0:
+        raise ValueError("required_horizon must be a positive integer")
+    available = available_world_model_horizon(
+        action_horizon,
+        control_hz=control_hz,
+        target_hz=target_hz,
+    )
+    if available < required_horizon:
+        raise ValueError(
+            "Policy candidate chunk cannot cover the configured WEAVER imagination horizon: "
+            f"action_horizon={action_horizon} at {control_hz:g} Hz provides {available} complete "
+            f"intervals at {target_hz:g} Hz, required={required_horizon}"
+        )
+    return available
 
 
 def predict_canonical_deltas(

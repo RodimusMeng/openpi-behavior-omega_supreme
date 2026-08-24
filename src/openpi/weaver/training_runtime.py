@@ -7,7 +7,7 @@ this module owns only the shared ``full``/``dynamics`` training semantics.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
 from contextlib import nullcontext
 import dataclasses
 import inspect
@@ -164,15 +164,21 @@ def build_optimizer(
     return optimizer
 
 
-def restore_optimizer_for_resume(optimizer: Any, checkpoint: Mapping[str, Any]) -> int:
-    """Restore an optimizer saved by this runtime and return its completed step."""
+def restore_optimizer_for_resume(optimizer: Any, checkpoint: MutableMapping[str, Any]) -> int:
+    """Restore optimizer/step and consume the large CPU checkpoint mapping."""
 
     if "optimizer" not in checkpoint or "step" not in checkpoint:
         raise ValueError("Resume checkpoint must contain optimizer and step")
     step = checkpoint["step"]
     if isinstance(step, bool) or not isinstance(step, int) or step < 0:
         raise ValueError(f"Resume checkpoint step must be a non-negative integer, got {step!r}")
-    optimizer.load_state_dict(checkpoint["optimizer"])
+    optimizer_state = checkpoint.pop("optimizer")
+    checkpoint.pop("step")
+    try:
+        optimizer.load_state_dict(optimizer_state)
+    finally:
+        del optimizer_state
+        checkpoint.clear()
     return step
 
 

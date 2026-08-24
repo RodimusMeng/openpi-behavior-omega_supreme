@@ -319,7 +319,13 @@ def load_episode_latents(
     return {key: _readonly_float32(value, name=key, ndim=3) for key, value in arrays.items()}
 
 
-def _load_norm_stats(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _load_norm_stats(
+    path: Path,
+    *,
+    expected_manifest_sha256: str | None = None,
+    expected_dataset_metadata_sha256: str | None = None,
+    expected_target_hz: float | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     value = _read_json(path)
     if value.get("schema_version") != NORM_SCHEMA_VERSION:
         raise ValueError(f"Unsupported WEAVER norm schema in {path}: {value.get('schema_version')!r}")
@@ -328,6 +334,17 @@ def _load_norm_stats(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np
         raise ValueError(f"Missing norm_stats object in {path}")
     state = stats.get("state")
     actions = stats.get("actions")
+    if value.get("source_split") != "train":
+        raise ValueError(f"Normalization statistics must declare source_split='train' in {path}")
+    if expected_manifest_sha256 is not None and value.get("train_manifest_sha256") != expected_manifest_sha256:
+        raise ValueError(f"Normalization statistics are from a different manifest index: {path}")
+    dataset = value.get("dataset")
+    if expected_dataset_metadata_sha256 is not None and (
+        not isinstance(dataset, Mapping) or dataset.get("metadata_sha256") != expected_dataset_metadata_sha256
+    ):
+        raise ValueError(f"Normalization statistics are from a different dataset metadata hash: {path}")
+    if expected_target_hz is not None and float(value.get("target_hz", -1)) != float(expected_target_hz):
+        raise ValueError(f"Normalization statistics target_hz does not match dataset: {path}")
     if not isinstance(state, Mapping) or state.get("representation") != "r1pro_compact_state_v1":
         raise ValueError(f"Wrong state normalization representation in {path}")
     if not isinstance(actions, Mapping) or actions.get("representation") != (
@@ -345,6 +362,28 @@ def _load_norm_stats(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np
     state_mean, state_std = pair(state, "state")
     action_mean, action_std = pair(actions, "actions")
     return state_mean, state_std, action_mean, action_std
+
+
+def norm_stats_provenance(path: str | Path) -> dict[str, Any]:
+    """Return the immutable identity fields for one normalization artifact."""
+
+    resolved = Path(path).expanduser().resolve()
+    value = _read_json(resolved)
+    required = ("schema_version", "source_split", "target_hz", "train_manifest_sha256", "episode_count")
+    missing = tuple(name for name in required if name not in value)
+    dataset = value.get("dataset")
+    if missing or not isinstance(dataset, Mapping):
+        raise ValueError(f"Normalization provenance is incomplete in {resolved}: missing={missing}")
+    return {
+        "path": str(resolved),
+        "sha256": _file_sha256(resolved),
+        "schema_version": value["schema_version"],
+        "source_split": value["source_split"],
+        "target_hz": value["target_hz"],
+        "train_manifest_sha256": value["train_manifest_sha256"],
+        "episode_count": value["episode_count"],
+        "dataset": dict(dataset),
+    }
 
 
 class BehaviorPrecomputed:
@@ -448,11 +487,23 @@ class BehaviorPrecomputed:
         self.manifests = tuple(manifests)
         self.normalize = normalize
         self.norm_stats: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
+        self.norm_stats_provenance: dict[str, Any] | None = None
         if normalize:
             norm_path = Path(norm_stats_path) if norm_stats_path is not None else self.root / "norm_stats.json"
             if not norm_path.is_absolute():
                 norm_path = self.root / norm_path
-            self.norm_stats = _load_norm_stats(norm_path.resolve())
+            manifest_sha = _file_sha256(self.root / "manifest.jsonl")
+            metadata_hashes = {str(manifest["dataset"]["metadata_sha256"]) for manifest in self.manifests}
+            target_rates = {float(manifest["target_hz"]) for manifest in self.manifests}
+            if len(metadata_hashes) != 1 or len(target_rates) != 1:
+                raise ValueError("Dataset manifests mix metadata hashes or target rates")
+            self.norm_stats = _load_norm_stats(
+                norm_path.resolve(),
+                expected_manifest_sha256=manifest_sha,
+                expected_dataset_metadata_sha256=metadata_hashes.pop(),
+                expected_target_hz=target_rates.pop(),
+            )
+            self.norm_stats_provenance = norm_stats_provenance(norm_path)
 
     def __len__(self) -> int:
         return len(self.manifests)

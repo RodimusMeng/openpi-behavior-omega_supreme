@@ -8,8 +8,6 @@ import json
 import os
 from pathlib import Path
 
-import tyro
-
 from openpi.weaver import b1k_dataset_adapter as _episode_adapter
 from openpi.weaver import behavior_precomputed
 from openpi.weaver import norm_stats
@@ -49,6 +47,11 @@ def _atomic_write_json(path: Path, value: object) -> None:
 
 
 def main(args: Args) -> None:
+    if args.max_episodes is not None:
+        raise ValueError(
+            "--max-episodes is intentionally unsupported for production normalization; "
+            "statistics must cover the complete train split"
+        )
     root = Path(args.dataset_dir).expanduser().resolve()
     index_path = root / "manifest.jsonl"
     if not index_path.is_file():
@@ -66,10 +69,6 @@ def main(args: Args) -> None:
             if manifest["split"] == "train":
                 manifests.append(manifest)
     manifests.sort(key=lambda value: int(value["episode_index"]))
-    if args.max_episodes is not None:
-        if args.max_episodes <= 0:
-            raise ValueError("max_episodes must be positive")
-        manifests = manifests[: args.max_episodes]
     if not manifests:
         raise ValueError("No train manifests found")
 
@@ -106,4 +105,6 @@ def main(args: Args) -> None:
 
 
 if __name__ == "__main__":
+    import tyro
+
     main(tyro.cli(Args))

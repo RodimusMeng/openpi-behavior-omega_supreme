@@ -48,8 +48,11 @@ class WeaverSteeringPolicy:
         action_time_edges_fn: Callable[[Mapping[str, Any], int], np.ndarray] | None = None,
         memory_fn: Callable[[Mapping[str, Any]], Any] | None = None,
         imagination_horizon: int,
+        policy_action_horizon: int | None = None,
         num_candidates: int = 4,
         replan_interval: int = 1,
+        control_hz: float = 30.0,
+        target_hz: float = 5.0,
         device: str = "cuda",
         gamma: float = 0.995,
         criterion: steering_runtime.SelectionCriterion = "advantage",
@@ -57,6 +60,16 @@ class WeaverSteeringPolicy:
     ) -> None:
         if num_candidates <= 0 or replan_interval <= 0 or imagination_horizon <= 0:
             raise ValueError("num_candidates, replan_interval, and imagination_horizon must be positive")
+        if policy_action_horizon is None:
+            model_config = getattr(policy, "_model", None)
+            policy_action_horizon = getattr(model_config, "action_horizon", None)
+        if policy_action_horizon is not None:
+            causal_action_adapter.require_world_model_horizon(
+                policy_action_horizon,
+                imagination_horizon,
+                control_hz=control_hz,
+                target_hz=target_hz,
+            )
         self.policy = policy
         self.adapter_model = adapter_model
         self.adapter_normalization = adapter_normalization
@@ -70,8 +83,11 @@ class WeaverSteeringPolicy:
         self.action_time_edges_fn = action_time_edges_fn or self._default_edges
         self.memory_fn = memory_fn
         self.imagination_horizon = int(imagination_horizon)
+        self.policy_action_horizon = None if policy_action_horizon is None else int(policy_action_horizon)
         self.num_candidates = int(num_candidates)
         self.replan_interval = int(replan_interval)
+        self.control_hz = float(control_hz)
+        self.target_hz = float(target_hz)
         self.device = device
         self.gamma = float(gamma)
         self.criterion = criterion
@@ -101,6 +117,11 @@ class WeaverSteeringPolicy:
         expected_digest = candidate_pool.observation_sha256(dict(observation))
         if pool.observation_digest != expected_digest:
             raise ValueError("Candidate pool observation digest changed before WEAVER scoring")
+        if self.policy_action_horizon is not None and pool.actions.shape[1] != self.policy_action_horizon:
+            raise ValueError(
+                "Policy returned a candidate horizon that differs from the constructor-audited horizon: "
+                f"returned={pool.actions.shape[1]}, audited={self.policy_action_horizon}"
+            )
         current_state = self.current_state_fn(observation)
         edges = self.action_time_edges_fn(observation, pool.actions.shape[1])
         adapted = causal_action_adapter.adapt_candidate_pool(
@@ -112,6 +133,7 @@ class WeaverSteeringPolicy:
             weaver_action_mean=self.weaver_action_mean,
             weaver_action_std=self.weaver_action_std,
             device=self.device,
+            target_hz=self.target_hz,
             max_horizon=self.imagination_horizon,
         )
         if adapted.normalized_weaver_actions.shape[1] != self.imagination_horizon:
@@ -153,7 +175,6 @@ class WeaverSteeringPolicy:
             pool_action_digests=tuple(item[2] for item in self._telemetry),
         )
 
-    @staticmethod
-    def _default_edges(observation: Mapping[str, Any], length: int) -> np.ndarray:
+    def _default_edges(self, observation: Mapping[str, Any], length: int) -> np.ndarray:
         del observation
-        return np.arange(length + 1, dtype=np.float64) / 30.0
+        return np.arange(length + 1, dtype=np.float64) / self.control_hz

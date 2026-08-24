@@ -5,6 +5,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+from typing import ClassVar
 
 import pytest
 import yaml
@@ -147,6 +148,23 @@ def test_lineage_is_required_for_resumed_checkpoint(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="no dataset lineage"):
         eval_weaver_b1k._assert_checkpoint_lineage_disjoint(
+            _Dataset(), checkpoint_dir=checkpoint_dir, checkpoint_mode="resume"
+        )
+
+
+def test_norm_provenance_is_required_and_must_match_for_trained_checkpoint(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "config.yaml").write_text(
+        yaml.safe_dump({"weaver_norm_provenance": {"sha256": "a" * 64, "path": "/train/norm.json"}}),
+        encoding="utf-8",
+    )
+
+    class _Dataset:
+        norm_stats_provenance: ClassVar = {"sha256": "b" * 64, "path": "/eval/norm.json"}
+
+    with pytest.raises(ValueError, match="normalization artifact differs"):
+        eval_weaver_b1k._assert_checkpoint_norm_provenance(
             _Dataset(), checkpoint_dir=checkpoint_dir, checkpoint_mode="resume"
         )
 

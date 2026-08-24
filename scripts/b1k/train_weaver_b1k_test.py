@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 # ruff: noqa: SLF001 -- script parsing and transaction helpers are the unit under test.
-
 import importlib.util
 import json
-import sys
 from pathlib import Path
+import sys
 
 import pytest
 import yaml
@@ -121,7 +120,7 @@ def test_dynamics_mode_changes_only_adapter_supervision_fields(tmp_path):
 def test_mode_supervision_cannot_be_silently_overridden(tmp_path):
     args = _args(tmp_path, "--mode", "full", "--override", "dataset.reward_mode=disabled")
 
-    with pytest.raises(ValueError, match="requires dataset.reward_mode"):
+    with pytest.raises(ValueError, match=r"requires dataset\.reward_mode"):
         train_script.load_training_config(args)
 
 
@@ -157,3 +156,70 @@ def test_training_lineage_records_exact_episode_semantics():
         "episode_indices": [3, 8],
         "semantic_sha256": ["a" * 64, "b" * 64],
     }
+
+
+def _resume_config() -> dict:
+    return {
+        "dataset": {
+            "path": "/new/dataset",
+            "norm_stats_path": "/new/dataset/norm_stats.json",
+            "n_states": 23,
+            "n_actions": 23,
+        },
+        "training": {"max_lr": 1e-4, "weight_decay": 0.01, "betas": [0.9, 0.99]},
+        "horizon": 8,
+    }
+
+
+def _lineage() -> dict:
+    return {"split": "train", "episode_count": 1, "episode_indices": [1], "semantic_sha256": ["a" * 64]}
+
+
+def _norm_provenance() -> dict:
+    return {
+        "path": "/new/dataset/norm_stats.json",
+        "sha256": "b" * 64,
+        "schema_version": "b1k_weaver_norm_v1",
+        "source_split": "train",
+        "target_hz": 5.0,
+        "train_manifest_sha256": "c" * 64,
+        "episode_count": 1,
+        "dataset": {"repo_id": "b1k-v3again", "metadata_sha256": "d" * 64},
+    }
+
+
+def test_resume_contract_accepts_relocated_data_paths(tmp_path: Path) -> None:
+    saved = {**_resume_config(), "weaver_lineage": _lineage(), "weaver_norm_provenance": _norm_provenance()}
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(saved), encoding="utf-8")
+    train_script._assert_resume_contract(
+        tmp_path, config=_resume_config(), lineage=_lineage(), norm_provenance=_norm_provenance()
+    )
+
+
+@pytest.mark.parametrize("field", ["max_lr", "norm_stats", "lineage"])
+def test_resume_contract_rejects_semantic_changes(tmp_path: Path, field: str) -> None:
+    saved = {**_resume_config(), "weaver_lineage": _lineage(), "weaver_norm_provenance": _norm_provenance()}
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(saved), encoding="utf-8")
+    current_config = _resume_config()
+    current_lineage = _lineage()
+    current_norm = _norm_provenance()
+    if field == "max_lr":
+        current_config["training"]["max_lr"] = 2e-4
+    elif field == "norm_stats":
+        current_norm["sha256"] = "e" * 64
+    else:
+        current_lineage["episode_indices"] = [2]
+    with pytest.raises(ValueError, match="Resume"):
+        train_script._assert_resume_contract(
+            tmp_path,
+            config=current_config,
+            lineage=current_lineage,
+            norm_provenance=current_norm,
+        )
+
+
+def test_resume_contract_requires_saved_config(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="missing its saved config"):
+        train_script._assert_resume_contract(
+            tmp_path, config=_resume_config(), lineage=_lineage(), norm_provenance=_norm_provenance()
+        )

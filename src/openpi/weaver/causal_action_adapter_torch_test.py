@@ -71,6 +71,26 @@ def test_gru_is_order_sensitive_instead_of_command_mean_pooling():
     assert not torch.allclose(forward, reversed_output)
 
 
+@pytest.mark.parametrize(
+    ("mask", "durations", "match"),
+    [
+        ([True, False, True], [0.05, 0.0, 0.15], "left-aligned prefix"),
+        ([True, True, False], [0.05, 0.0, 0.0], "strictly positive"),
+        ([True, True, False], [0.05, float("nan"), 0.0], "finite"),
+        ([True, True, False], [0.05, 0.15, 0.01], "exactly zero"),
+    ],
+)
+def test_gru_fails_closed_on_invalid_mask_and_duration_contract(mask, durations, match):
+    model = adapter.build_torch_model(adapter.AdapterSpec(hidden_dim=8, num_layers=1))
+    with pytest.raises(ValueError, match=match):
+        model(
+            torch.zeros(1, 23),
+            torch.zeros(1, 3, 23),
+            torch.tensor([durations], dtype=torch.float32),
+            torch.tensor([mask], dtype=torch.bool),
+        )
+
+
 class _DurationWeightedCommands(torch.nn.Module):
     def forward(self, current_state, policy_actions, action_durations_s, mask):
         del current_state

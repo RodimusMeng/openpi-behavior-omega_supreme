@@ -159,6 +159,11 @@ def run(
         checkpoint_dir=Path(args.checkpoint_dir).expanduser().resolve(),
         checkpoint_mode=args.checkpoint_mode,
     )
+    _assert_checkpoint_norm_provenance(
+        base_dataset,
+        checkpoint_dir=Path(args.checkpoint_dir).expanduser().resolve(),
+        checkpoint_mode=args.checkpoint_mode,
+    )
     held_out = prediction_eval.HeldOutWindowDataset(
         base_dataset,
         max_horizon=max(horizons),
@@ -478,6 +483,42 @@ def _assert_checkpoint_lineage_disjoint(
             "Held-out evaluation overlaps training lineage: "
             f"episode_indices={sorted(episode_overlap)}, semantic_sha256={sorted(semantic_overlap)}"
         )
+
+
+def _assert_checkpoint_norm_provenance(
+    dataset: Any,
+    *,
+    checkpoint_dir: Path,
+    checkpoint_mode: str,
+) -> None:
+    """Prove held-out normalization is identical to the training artifact."""
+
+    config_path = checkpoint_dir / "config.yaml"
+    if not config_path.is_file():
+        if checkpoint_mode != "b1k_23d_fresh":
+            raise ValueError("Trained checkpoint has no saved config for normalization provenance")
+        return
+    try:
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise ValueError(f"Could not read checkpoint config {config_path}: {exc}") from exc
+    if not isinstance(saved, Mapping):
+        raise ValueError(f"Checkpoint config must contain a mapping: {config_path}")
+    expected = saved.get("weaver_norm_provenance")
+    if expected is None:
+        if checkpoint_mode != "b1k_23d_fresh":
+            raise ValueError("Trained checkpoint has no normalization provenance")
+        return
+    actual = getattr(dataset, "norm_stats_provenance", None)
+    if _canonical_norm_provenance(expected) != _canonical_norm_provenance(actual):
+        raise ValueError("Held-out normalization artifact differs from checkpoint training provenance")
+
+
+def _canonical_norm_provenance(value: Any) -> Any:
+    if not isinstance(value, Mapping):
+        return None
+    normalized = {str(key): item for key, item in value.items() if key != "path"}
+    return json.loads(json.dumps(normalized, sort_keys=True, allow_nan=False))
 
 
 def _positive_int(value: Any, *, name: str) -> int:

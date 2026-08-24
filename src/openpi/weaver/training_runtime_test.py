@@ -219,6 +219,7 @@ def test_resume_restores_optimizer_and_completed_step():
     checkpoint = {"optimizer": optimizer.state_dict(), "step": 7}
 
     assert training_runtime.restore_optimizer_for_resume(optimizer, checkpoint) == 7
+    assert checkpoint == {}
 
     with pytest.raises(ValueError, match="optimizer and step"):
         training_runtime.restore_optimizer_for_resume(optimizer, {})
