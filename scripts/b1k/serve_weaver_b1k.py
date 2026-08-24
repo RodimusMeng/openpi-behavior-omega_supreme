@@ -152,6 +152,26 @@ def _load_adapter(path: str | Path, device: str) -> tuple[Any, causal_action_ada
     return model, normalization
 
 
+def _policy_include_depth(policy_config: Any) -> bool:
+    """Return the policy's RGB/RGBD serving mode from its registered config.
+
+    The B1K RGBD checkpoint is a four-channel model and must receive the depth
+    keys emitted by ``RGBDFullResWrapper``.  Keeping this derived from the
+    OpenPI config prevents accidentally loading ``pi05_b1k_full_rgbd`` while
+    silently feeding it the old RGB-only three-channel path.
+    """
+    data_include_depth = bool(getattr(policy_config.data, "include_depth", False))
+    image_channels = int(getattr(policy_config.model, "image_channels", 3))
+    expected_channels = 4 if data_include_depth else 3
+    if image_channels != expected_channels:
+        raise ValueError(
+            "OpenPI B1K modality mismatch: "
+            f"data.include_depth={data_include_depth} requires image_channels={expected_channels}, "
+            f"got {image_channels}"
+        )
+    return data_include_depth
+
+
 class _RawCandidatePolicy:
     """Bridge raw evaluator observations to the existing OpenPI infer API."""
 
@@ -357,6 +377,7 @@ def main(args: Args) -> None:
     state_mean, state_std, action_mean, action_std = _load_norm(args.norm_stats)
 
     policy_cfg = __import__("openpi.training.config", fromlist=["get_config"]).get_config(args.policy_config)
+    include_depth = _policy_include_depth(policy_cfg)
     task_repo_id = f"{task_bucket}/{task_name}"
     data_cfg = dataclasses.replace(policy_cfg.data, repo_id=task_repo_id, robot_config_name=args.robot)
     policy_cfg = dataclasses.replace(policy_cfg, data=data_cfg)
@@ -369,7 +390,7 @@ def main(args: Args) -> None:
     model._gamma = float(config.get("model", {}).get("discount_factor", 0.995))
     processor = B1KPolicyWrapper(policy=base, robot=args.robot, text_prompt=prompt,
                                  control_mode="receding_horizon", action_horizon=args.action_horizon,
-                                 max_len=int(policy_cfg.model.action_horizon), include_depth=False)
+                                 max_len=int(policy_cfg.model.action_horizon), include_depth=include_depth)
     policy = OnlineWeaverPolicy(base_policy=base, processor=processor, model=model, adapter=adapter_model,
                                 adapter_norm=adapter_norm, state_mean=state_mean, state_std=state_std,
                                 action_mean=action_mean, action_std=action_std, task_prompt=prompt,

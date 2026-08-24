@@ -8,6 +8,7 @@ import torch
 
 from openpi.weaver.causal_action_adapter import require_world_model_horizon
 from scripts.b1k.serve_weaver_b1k import _load_norm
+from scripts.b1k.serve_weaver_b1k import _policy_include_depth
 from scripts.b1k.serve_weaver_b1k import _resize_batch
 from scripts.b1k.serve_weaver_b1k import _resolve_task
 
@@ -63,3 +64,18 @@ def test_resolve_task_accepts_bare_name_and_explicit_prompt() -> None:
     )
     with pytest.raises(ValueError, match="empty"):
         _resolve_task("", None, registry)
+
+
+def test_policy_include_depth_follows_registered_rgbd_config() -> None:
+    config = mock.Mock()
+    config.data.include_depth = True
+    config.model.image_channels = 4
+    assert _policy_include_depth(config) is True
+
+
+def test_policy_include_depth_rejects_rgbd_channel_mismatch() -> None:
+    config = mock.Mock()
+    config.data.include_depth = True
+    config.model.image_channels = 3
+    with pytest.raises(ValueError, match="modality mismatch"):
+        _policy_include_depth(config)
