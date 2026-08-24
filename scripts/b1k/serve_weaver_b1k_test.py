@@ -9,6 +9,7 @@ import torch
 from openpi.weaver.causal_action_adapter import require_world_model_horizon
 from scripts.b1k.serve_weaver_b1k import _load_norm
 from scripts.b1k.serve_weaver_b1k import _resize_batch
+from scripts.b1k.serve_weaver_b1k import _resolve_task
 
 
 def test_resize_letterbox_matches_target_shape_and_range() -> None:
@@ -50,3 +51,15 @@ def test_horizon_contract_rejects_short_policy_chunks() -> None:
     assert require_world_model_horizon(32, 5) == 5
     with pytest.raises(ValueError, match="cannot cover"):
         require_world_model_horizon(32, 6)
+
+
+def test_resolve_task_accepts_bare_name_and_explicit_prompt() -> None:
+    registry = {"b1k": {"demo": "Do the demo."}}
+    assert _resolve_task("demo", None, registry) == ("b1k", "demo", "Do the demo.")
+    assert _resolve_task("b1k/unknown", "Do the unknown.", registry) == (
+        "b1k",
+        "unknown",
+        "Do the unknown.",
+    )
+    with pytest.raises(ValueError, match="empty"):
+        _resolve_task("", None, registry)

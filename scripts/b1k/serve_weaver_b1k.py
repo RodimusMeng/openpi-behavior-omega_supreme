@@ -30,6 +30,32 @@ from openpi.weaver import upstream_runtime
 LOGGER = logging.getLogger(__name__)
 
 
+def _resolve_task(task: str, prompt_override: str | None, registry: dict[str, dict[str, str]]) -> tuple[str, str, str]:
+    task_value = str(task).strip()
+    if not task_value:
+        raise ValueError("--task must be a non-empty task name or 'bucket/name'")
+    if "/" in task_value:
+        task_bucket, task_name = task_value.split("/", 1)
+    else:
+        task_bucket, task_name = "b1k", task_value
+    if not task_bucket or not task_name:
+        raise ValueError(f"Invalid --task {task!r}; expected task name or 'bucket/name'")
+    if prompt_override is not None:
+        prompt = prompt_override.strip()
+        if not prompt:
+            raise ValueError("--prompt must be non-empty when supplied")
+        return task_bucket, task_name, prompt
+    try:
+        return task_bucket, task_name, registry[task_bucket][task_name]
+    except KeyError as exc:
+        available = sorted(registry.get(task_bucket, {}))
+        raise ValueError(
+            f"No registered prompt for task {task_bucket}/{task_name}. "
+            "Pass --prompt with the exact BDDL/OpenPI instruction. "
+            f"Known local tasks for {task_bucket!r}: {available}"
+        ) from exc
+
+
 @dataclasses.dataclass
 class Args:
     robot: str
@@ -41,6 +67,7 @@ class Args:
     adapter_checkpoint: str
     norm_stats: str
     dataset_dir: str
+    prompt: str | None = None
     port: int = 8000
     num_candidates: int = 4
     control_hz: float = 30.0
@@ -300,10 +327,20 @@ def main(args: Args) -> None:
     from openpi.serving import websocket_b1k_server  # noqa: PLC0415
     from openpi.shared.eval_b1k_wrapper import B1KPolicyWrapper  # noqa: PLC0415
 
+    required_paths = {
+        "policy_dir": args.policy_dir,
+        "weaver_config": args.weaver_config,
+        "weaver_checkpoint": args.weaver_checkpoint,
+        "adapter_checkpoint": args.adapter_checkpoint,
+        "norm_stats": args.norm_stats,
+        "dataset_dir": args.dataset_dir,
+    }
+    empty_paths = tuple(name for name, value in required_paths.items() if not str(value).strip())
+    if empty_paths:
+        raise ValueError(f"Required WEAVER serving paths are empty: {empty_paths}")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("WEAVER serving requested CUDA but torch.cuda.is_available() is false")
-    task_bucket, task_name = args.task.split("/", 1)
-    prompt = TASK_REGISTRY[task_bucket][task_name]
+    task_bucket, task_name, prompt = _resolve_task(args.task, args.prompt, TASK_REGISTRY)
     raw_config = yaml.safe_load(Path(args.weaver_config).expanduser().resolve().read_text(encoding="utf-8"))
     config, _ = upstream_config.build_behavior_config(raw_config, dataset_root=args.dataset_dir,
                                                        norm_stats_path=args.norm_stats, dynamics_only=False)
@@ -320,7 +357,8 @@ def main(args: Args) -> None:
     state_mean, state_std, action_mean, action_std = _load_norm(args.norm_stats)
 
     policy_cfg = __import__("openpi.training.config", fromlist=["get_config"]).get_config(args.policy_config)
-    data_cfg = dataclasses.replace(policy_cfg.data, repo_id=args.task, robot_config_name=args.robot)
+    task_repo_id = f"{task_bucket}/{task_name}"
+    data_cfg = dataclasses.replace(policy_cfg.data, repo_id=task_repo_id, robot_config_name=args.robot)
     policy_cfg = dataclasses.replace(policy_cfg, data=data_cfg)
     base = policy_config.create_trained_policy(policy_cfg, args.policy_dir,
                                                sample_kwargs={"num_steps": args.num_flow_steps}, default_prompt=prompt)

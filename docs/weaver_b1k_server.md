@@ -17,10 +17,12 @@ intervals; it cannot be silently padded to H=8.
 ```bash
 cd "$OPENPI_ROOT"
 export PYTHONPATH="$OPENPI_ROOT/src:$WEAVER_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export TASK_ID=turning_on_radio
+test -n "$TASK_ID"
 
 uv run python scripts/b1k/serve_weaver_b1k.py \
   --robot b1k/R1Pro \
-  --task b1k/<TASK_NAME> \
+  --task "$TASK_ID" \
   --policy-config <OPENPI_TRAINING_CONFIG> \
   --policy-dir <OPENPI_POLICY_CHECKPOINT> \
   --weaver-config "$WEAVER_RELEASE/WEAVER/config.yaml" \
@@ -37,6 +39,11 @@ uv run python scripts/b1k/serve_weaver_b1k.py \
   --port 8000
 ```
 
+`--task` accepts either a bare task name such as `turning_on_radio` or the
+fully qualified `b1k/turning_on_radio`. If the local registry does not contain
+the task prompt, pass `--prompt "<exact BDDL/OpenPI instruction>"`; an empty
+shell variable is rejected before any checkpoint is loaded.
+
 Use `--imagination-horizon 8` only after the policy checkpoint is verified to
 produce at least 48 actions per inference call. The server returns one CPU
 `float32` 23-D action per evaluator step and supports the official reset
@@ -48,3 +55,12 @@ Run the BEHAVIOR v3.9.1 evaluator in another shell with its normal
 `RGBDFullResWrapper`, `--mode public_test`, `--num-rollouts 1`, and the official
 R1Pro config. The evaluator connects to `127.0.0.1:8000`; do not alter the
 camera key names or inject simulator state/reward into the server.
+
+If the BEHAVIOR environment reports `ModuleNotFoundError: h5py`, install it in
+that environment before launching OmniGibson:
+
+```bash
+behavioron
+python -m pip install h5py
+python -c 'import h5py; print(h5py.__version__)'
+```
