@@ -36,8 +36,8 @@ uv run python scripts/b1k/serve_weaver_b1k.py \
   --weaver-checkpoint <WEAVER_23D_CHECKPOINT_DIR> \
   --checkpoint-mode resume \
   --adapter-checkpoint <ACTION_ADAPTER_DIR>/checkpoint.pt \
-  --norm-stats "$WEAVER_WORK_ROOT/numeric-full-v4/norm_stats.json" \
-  --dataset-dir "$WEAVER_WORK_ROOT/numeric-full-v4" \
+  --norm-stats "$WEAVER_WORK_ROOT/numeric-full-v6/norm_stats.json" \
+  --dataset-dir "$WEAVER_WORK_ROOT/numeric-full-v6" \
   --device cuda \
   --num-candidates 4 \
   --imagination-horizon 5 \
@@ -52,9 +52,9 @@ server reads the natural-language instruction from the preparation output
 `--prompt` remains an explicit override; the small in-repository registry is
 only a compatibility fallback for older artifacts.
 
-The v4 preparation schema changes terminal cropping, prompt conditioning and
+The v6 preparation schema changes terminal-label handling, prompt conditioning and
 the action-delta convention. Do not reuse an older `numeric-full` directory;
-write a new directory such as `numeric-full-v4` and recompute downstream
+write a new directory such as `numeric-full-v6` and recompute downstream
 normalization, latent cache, adapter and WEAVER checkpoints from it.
 
 Use `--imagination-horizon 8` only after the policy checkpoint is verified to

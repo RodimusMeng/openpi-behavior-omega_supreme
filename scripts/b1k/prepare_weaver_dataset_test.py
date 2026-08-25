@@ -130,13 +130,14 @@ def test_reward_diagnostics_preserve_span_and_terminal_provenance():
     )
     assert diagnostics["cumulative_span"] == 2.0
     assert diagnostics["first_done_row"] == 1
-    assert diagnostics["terminal_suffix_start_row"] == 1
-    assert diagnostics["intermediate_done_count"] == 0
-    assert diagnostics["sampled_terminal_target_row"] == 2
-    assert diagnostics["post_terminal_suffix_max_abs_reward"] == 1.0
+    assert diagnostics["done_run_count"] == 1
+    assert diagnostics["final_done_run_start_row"] == 1
+    assert diagnostics["done_reaches_metadata_episode_end"] is True
+    assert diagnostics["first_sampled_row_at_or_after_first_done"] == 2
+    assert diagnostics["recorded_reward_max_abs_at_or_after_first_done"] == 1.0
 
 
-def test_reward_diagnostics_distinguish_intermediate_and_final_terminal_runs():
+def test_reward_diagnostics_distinguish_multiple_recorded_done_runs():
     diagnostics = prepare._reward_diagnostics(
         np.asarray([0.0, 1.0, 0.0, -1.0, 0.0, 1.0, 0.0]),
         np.asarray([False, True, True, False, False, True, True]),
@@ -144,10 +145,23 @@ def test_reward_diagnostics_distinguish_intermediate_and_final_terminal_runs():
         np.asarray([0, 3, 6]),
     )
     assert diagnostics["first_done_row"] == 1
-    assert diagnostics["terminal_suffix_start_row"] == 5
-    assert diagnostics["intermediate_done_count"] == 2
-    assert diagnostics["sampled_terminal_target_row"] == 6
-    assert diagnostics["post_terminal_suffix_max_abs_reward"] == 0.0
+    assert diagnostics["done_run_count"] == 2
+    assert diagnostics["final_done_run_start_row"] == 5
+    assert diagnostics["done_reaches_metadata_episode_end"] is True
+    assert diagnostics["first_sampled_row_at_or_after_first_done"] == 3
+    assert diagnostics["recorded_reward_max_abs_at_or_after_first_done"] == 1.0
+
+
+def test_reward_diagnostics_records_nonzero_reward_in_done_suffix_without_rejecting():
+    diagnostics = prepare._reward_diagnostics(
+        np.asarray([0.0] * 13 + [0.33333334] + [0.0] * 169 + [0.33333334] + [0.0] * 3),
+        np.asarray([False] * 13 + [True] * 174),
+        np.zeros(187, dtype=bool),
+        np.asarray([0, 6, 12, 18, 24, 30]),
+    )
+    assert diagnostics["final_done_run_start_row"] == 13
+    assert diagnostics["done_reaches_metadata_episode_end"] is True
+    assert diagnostics["recorded_reward_max_abs_at_or_after_first_done"] == pytest.approx(0.33333334)
 
 
 def _artifact(root, episode_index: int = 0):

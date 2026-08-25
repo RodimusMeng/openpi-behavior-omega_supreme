@@ -14,7 +14,7 @@ def test_aggregates_every_source_transition_in_half_open_interval() -> None:
     assert not result.transition_valid.flags.writeable
 
 
-def test_terminal_marker_accepts_final_pulse_and_absorbing_suffix() -> None:
+def test_terminal_marker_is_preserved_as_source_label() -> None:
     rewards = np.zeros(7, dtype=np.float32)
     terminated = np.zeros((7, 1), dtype=bool)
     terminated[-1] = True
@@ -36,7 +36,7 @@ def test_terminal_marker_accepts_final_pulse_and_absorbing_suffix() -> None:
     np.testing.assert_array_equal(result.transition_valid, [True, True, False])
 
 
-def test_intermediate_terminal_run_is_preserved_before_final_suffix() -> None:
+def test_intermediate_terminal_run_is_preserved() -> None:
     rewards = np.zeros(7, dtype=np.float32)
     terminated = np.zeros(7, dtype=bool)
     terminated[2:4] = True
@@ -51,19 +51,19 @@ def test_intermediate_terminal_run_is_preserved_before_final_suffix() -> None:
     np.testing.assert_allclose(result.rewards, [1.0, -1.0, 0.0])
 
 
-def test_terminal_marker_without_final_suffix_is_rejected() -> None:
+def test_terminal_marker_without_final_suffix_is_preserved() -> None:
     rewards = np.zeros(7, dtype=np.float32)
     terminated = np.zeros(7, dtype=bool)
     terminated[2:5] = True
-    with pytest.raises(ValueError, match="final row"):
-        reward_contract.aggregate_progress_rewards(
-            rewards,
-            np.asarray([0, 3, 6]),
-            source_terminated=terminated,
-        )
+    result = reward_contract.aggregate_progress_rewards(
+        rewards,
+        np.asarray([0, 3, 6]),
+        source_terminated=terminated,
+    )
+    np.testing.assert_array_equal(result.transition_valid, [True, True, False])
 
 
-def test_terminated_and_truncated_union_uses_final_suffix_boundary() -> None:
+def test_terminated_and_truncated_markers_are_both_preserved() -> None:
     rewards = np.zeros(8, dtype=np.float32)
     terminated = np.zeros(8, dtype=bool)
     truncated = np.zeros(8, dtype=bool)
@@ -90,7 +90,7 @@ def test_terminated_and_truncated_union_uses_final_suffix_boundary() -> None:
     np.testing.assert_array_equal(result.transition_valid, [True, True, False])
 
 
-def test_accepts_behavior_style_long_absorbing_suffix() -> None:
+def test_accepts_behavior_style_long_terminal_run() -> None:
     rewards = np.zeros(12, dtype=np.float32)
     terminated = np.zeros(12, dtype=bool)
     terminated[7:] = True
@@ -102,17 +102,17 @@ def test_accepts_behavior_style_long_absorbing_suffix() -> None:
     np.testing.assert_array_equal(result.transition_valid, [True, True, True, False])
 
 
-def test_rejects_nonzero_reward_after_final_terminal_transition() -> None:
+def test_preserves_nonzero_rewards_inside_recorded_terminal_run() -> None:
     rewards = np.zeros(8, dtype=np.float32)
     rewards[6] = 0.25
     terminated = np.zeros(8, dtype=bool)
     terminated[4:] = True
-    with pytest.raises(ValueError, match="zero recorded reward"):
-        reward_contract.aggregate_progress_rewards(
-            rewards,
-            np.asarray([0, 3, 7]),
-            source_terminated=terminated,
-        )
+    result = reward_contract.aggregate_progress_rewards(
+        rewards,
+        np.asarray([0, 3, 7]),
+        source_terminated=terminated,
+    )
+    np.testing.assert_allclose(result.rewards, [0.0, 0.25, 0.0])
 
 
 def test_rejects_endpoint_sampling_shapes_but_preserves_recorded_reward_scale() -> None:

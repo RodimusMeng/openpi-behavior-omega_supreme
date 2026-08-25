@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 
-REWARD_REPRESENTATION = "b1k_behavior_recorded_transition_reward_5hz_v3"
+REWARD_REPRESENTATION = "b1k_behavior_recorded_transition_reward_5hz_v4"
 REWARD_CONTRACT = {
     "representation": REWARD_REPRESENTATION,
     "alignment": "sum_next_reward_over_source_rows_i_to_j_exclusive",
@@ -24,7 +24,9 @@ REWARD_CONTRACT = {
     "state_aligned": False,
     "transition_aligned": True,
     "terminal_row_valid": False,
-    "terminal_marker_semantics": "intermediate_runs_plus_final_absorbing_suffix",
+    "terminal_marker_semantics": "source_labels_preserved_episode_boundary_from_metadata_offsets",
+    "terminal_reward_policy": "preserve_recorded_rewards_without_zero_suffix_assumption",
+    "final_source_tail_policy": "preserved_in_source_arrays_not_supervised_without_later_sampled_observation",
     "privileged_offline_label": True,
     "allowed_online_input": False,
 }
@@ -39,14 +41,12 @@ class AggregatedRewards:
 
 
 def terminal_suffix_start(done: Any) -> int | None:
-    """Return the start of the final terminal/timeout suffix.
+    """Return the start of a final contiguous true marker run, if present.
 
-    BEHAVIOR exports can contain an intermediate run of terminal markers and
-    then continue the same episode (as in episode 147 of v3again).  Such runs
-    are retained as ordinary source transitions.  The only marker that
-    defines the episode boundary is the final contiguous run reaching the
-    source episode's last row.  A marker that does not reach the final row is
-    rejected because no authoritative episode boundary can be established.
+    This is a diagnostic helper only. Metadata episode offsets, rather than
+    this marker pattern, define the official episode boundary. A marker run
+    that does not reach the final row is still returned as a source-label
+    diagnostic and is never rejected here.
     """
 
     array = np.asarray(done)
@@ -57,11 +57,6 @@ def terminal_suffix_start(done: Any) -> int | None:
     positions = np.flatnonzero(array)
     if positions.size == 0:
         return None
-    if not bool(array[-1]):
-        raise ValueError(
-            "Termination/truncation markers must include the source episode's final row; "
-            f"got {positions.tolist()}"
-        )
     suffix_start = int(positions[-1])
     while suffix_start > 0 and bool(array[suffix_start - 1]):
         suffix_start -= 1
@@ -117,7 +112,7 @@ def aggregate_progress_rewards(
             done |= terminated
         if truncated is not None:
             done |= truncated
-        _validate_terminal_suffix(done, rewards=rewards, tolerance=tolerance)
+        _validate_terminal_markers(done)
 
     del validate_progress_range
     aggregated = np.zeros(indices.size, dtype=np.float32)
@@ -155,22 +150,15 @@ def _optional_bool_vector(value: Any | None, *, length: int, name: str) -> np.nd
     return np.ascontiguousarray(array)
 
 
-def _validate_terminal_suffix(done: np.ndarray, *, rewards: np.ndarray, tolerance: float) -> None:
-    """Validate BEHAVIOR's terminal convention.
+def _validate_terminal_markers(done: np.ndarray) -> None:
+    """Validate marker shape without imposing an absorbing-reward convention.
 
-    Dataset exports may contain intermediate terminal runs before the final
-    absorbing suffix.  Those rows remain part of the source trajectory.  The
-    final suffix is the only boundary, and repeated rows after its first row
-    must carry zero reward.
+    BEHAVIOR's LeRobot export records the result of each environment step in
+    ``next.terminated``/``next.truncated``.  In the 2026 full export a success
+    marker may remain true through the remainder of the recorded episode while
+    actions, states, and later progress rewards continue to be recorded.  The
+    metadata episode offsets are therefore the only authoritative episode
+    boundary.  This function intentionally performs no reward-value check.
     """
 
-    suffix_start = terminal_suffix_start(done)
-    if suffix_start is None:
-        return
-    if suffix_start + 1 < rewards.size and not np.allclose(
-        rewards[suffix_start + 1 :], 0.0, rtol=0.0, atol=tolerance
-    ):
-        raise ValueError(
-            "Repeated terminal/absorbing rows must have zero recorded reward after the final terminal transition; "
-            f"nonzero suffix starts at row {suffix_start + 1}"
-        )
+    del done

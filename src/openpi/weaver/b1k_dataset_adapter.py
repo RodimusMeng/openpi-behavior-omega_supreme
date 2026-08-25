@@ -27,7 +27,7 @@ from openpi.weaver.b1k_contract import B1KWeaverContract
 from openpi.weaver.b1k_contract import build_r1pro_contract
 from openpi.weaver.b1k_contract import world_model_frame_indices
 
-SCHEMA_VERSION = "b1k_weaver_episode_v5"
+SCHEMA_VERSION = "b1k_weaver_episode_v6"
 POLICY_ACTION_REPRESENTATION = "b1k_policy_mixed_v1"
 STATE_DELTA_ACTION_REPRESENTATION = "r1pro_compact_state_delta_v1"
 TRAINING_ACTION_CONTRACT = {
@@ -337,27 +337,11 @@ def adapt_episode(
         target_hz=target_hz,
         max_timing_error_s=max_timing_error_s,
     )
-    if terminated is not None or truncated is not None:
-        done = np.zeros(source_length, dtype=bool)
-        for value, name in ((terminated, "terminated"), (truncated, "truncated")):
-            if value is None:
-                continue
-            marker = np.asarray(value)
-            if marker.ndim == 2 and marker.shape[1] == 1:
-                marker = marker[:, 0]
-            if marker.ndim != 1 or marker.shape[0] != source_length or marker.dtype != np.bool_:
-                raise ValueError(f"{name} must be a boolean vector matching the source episode")
-            done |= marker
-        terminal_suffix = _reward_contract.terminal_suffix_start(done)
-        if terminal_suffix is not None:
-            terminal_target = int(np.searchsorted(frame_indices, terminal_suffix + 1, side="left"))
-            if terminal_target >= frame_indices.size:
-                raise ValueError(
-                    f"Episode {episode_index} has its final terminal suffix starting at source row {terminal_suffix}, "
-                    "but no later 5 Hz observation exists to represent its outcome"
-                )
-            frame_indices = frame_indices[: terminal_target + 1]
-            timing_errors = timing_errors[: terminal_target + 1]
+    # The LeRobot episode metadata offsets are the authoritative episode
+    # boundary. BEHAVIOR's recorded ``next.terminated`` marker can remain
+    # true after a success while the exporter continues recording actions,
+    # observations, and later progress rewards. It is retained as a source
+    # label and audited by the reward contract, but must not crop this episode.
     if frame_indices.size < min_sampled_frames:
         raise ValueError(
             f"Episode {episode_index} has only {frame_indices.size} sampled frames through its valid boundary; "

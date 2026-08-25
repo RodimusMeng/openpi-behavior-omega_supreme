@@ -308,14 +308,20 @@ def _reward_diagnostics(
     done = term | trunc
     done_positions = np.flatnonzero(done)
     first_done = int(done_positions[0]) if done_positions.size else None
-    terminal_suffix_start = _reward_contract.terminal_suffix_start(done)
     first_term = int(np.flatnonzero(term)[0]) if np.any(term) else None
     first_trunc = int(np.flatnonzero(trunc)[0]) if np.any(trunc) else None
     cumulative = np.concatenate(([0.0], np.cumsum(values, dtype=np.float64)))
-    terminal_target = None
-    if terminal_suffix_start is not None:
-        target = int(np.searchsorted(sampled_frame_indices, terminal_suffix_start + 1, side="left"))
-        terminal_target = int(sampled_frame_indices[target]) if target < len(sampled_frame_indices) else None
+    done_run_count = int(np.count_nonzero(done & np.r_[True, ~done[:-1]])) if done.size else 0
+    final_done_run_start = None
+    if done.size and bool(done[-1]):
+        final_done_run_start = int(done.size - 1)
+        while final_done_run_start > 0 and bool(done[final_done_run_start - 1]):
+            final_done_run_start -= 1
+    first_sampled_at_or_after_done = None
+    if first_done is not None:
+        target = int(np.searchsorted(sampled_frame_indices, first_done, side="left"))
+        if target < len(sampled_frame_indices):
+            first_sampled_at_or_after_done = int(sampled_frame_indices[target])
     # The transition at the final sampled observation has no sampled successor,
     # so it is part of the unrepresentable tail as well.
     tail_start = int(sampled_frame_indices[-1]) if len(sampled_frame_indices) else len(values)
@@ -329,16 +335,15 @@ def _reward_diagnostics(
         "first_terminated_row": first_term,
         "first_truncated_row": first_trunc,
         "first_done_row": first_done,
-        "terminal_suffix_start_row": terminal_suffix_start,
-        "intermediate_done_count": int(np.count_nonzero(done[:terminal_suffix_start]))
-        if terminal_suffix_start is not None
-        else 0,
-        "post_terminal_suffix_max_abs_reward": float(
-            np.max(np.abs(values[terminal_suffix_start + 1 :]), initial=0.0)
+        "done_run_count": done_run_count,
+        "final_done_run_start_row": final_done_run_start,
+        "done_reaches_metadata_episode_end": bool(done.size and done[-1]),
+        "first_sampled_row_at_or_after_first_done": first_sampled_at_or_after_done,
+        "recorded_reward_max_abs_at_or_after_first_done": float(
+            np.max(np.abs(values[first_done:]), initial=0.0)
         )
-        if terminal_suffix_start is not None
+        if first_done is not None
         else 0.0,
-        "sampled_terminal_target_row": terminal_target,
         "unsampled_tail_count": int(tail.size),
         "unsampled_tail_reward_sum": float(tail.sum()),
         "unsampled_tail_reward_max_abs": float(np.max(np.abs(tail), initial=0.0)),
@@ -817,11 +822,6 @@ def main(args: Args) -> None:
                 source_truncated,
                 adapted.source_frame_indices,
             )
-            if reward_diagnostics["unsampled_tail_reward_max_abs"] > 1e-5:
-                raise ValueError(
-                    "Nonzero recorded reward exists after the last valid 5 Hz observation target: "
-                    f"{reward_diagnostics}"
-                )
             split = splits[episode_index]
             manifest = _adapter.episode_manifest(
                 adapted,

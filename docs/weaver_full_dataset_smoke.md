@@ -2,7 +2,7 @@
 
 This protocol uses the complete `b1k-v3again` metadata/data path. It does not
 launch a task-specific evaluator and does not use the old radio scripts. The
-materialized full run must use a new directory such as `numeric-full-v4`; do
+materialized full run must use a new directory such as `numeric-full-v6`; do
 not resume or overwrite an older `numeric-full` schema.
 
 The gates are deliberately separate:
@@ -103,21 +103,22 @@ treated as a RoboMeter state-progress label. Full-mode windows reserve one
 additional real successor so the terminal sentinel never reaches the frozen
 reward/critic heads.
 
-BEHAVIOR exports can contain an intermediate run of `next.terminated=True`
-before the task's final absorbing suffix. The first marker is therefore not an
-episode boundary: intermediate rows and their recorded rewards remain in the
-source trajectory. The adapter uses only the final contiguous
-terminated/truncated suffix, which must reach the source episode's last row,
-as the boundary. It retains the final terminal transition and the first real
-sampled successor as the terminal target, while rejecting nonzero rewards in
-the remaining absorbing tail. This is fail-closed and applies identically to
-the numeric preparation diagnostics and the training adapter.
+BEHAVIOR's LeRobot writer records `next.terminated`, `next.truncated`, and
+`next.reward` for every exported simulator step. A success marker may remain
+true while the official exporter continues recording observations, actions, and
+later progress rewards. Therefore the `[dataset_from_index,
+dataset_to_index)` episode offsets in `meta/episodes` are the only authoritative
+episode boundary. The adapter preserves all source rows and all three source
+labels, audits marker runs and the unrepresented source tail, and never crops or
+rejects a row solely because a marker is true. Only the final sampled
+observation is invalid for supervised transition training because it has no
+later sampled observation; its source tail remains preserved for audit.
 
 For the actual full-data preparation, use the same command without subset
 selection and write to a fresh output directory:
 
 ```bash
-export NUMERIC_FULL="$WEAVER_WORK_ROOT/numeric-full-v4"
+export NUMERIC_FULL="$WEAVER_WORK_ROOT/numeric-full-v6"
 test ! -e "$NUMERIC_FULL"
 
 uv run python scripts/b1k/prepare_weaver_dataset.py \
