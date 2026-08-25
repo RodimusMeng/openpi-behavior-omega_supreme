@@ -10,11 +10,14 @@ provenance for later caches to reject stale or incompatible artifacts.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import json
 import math
 import os
+import socket
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +53,80 @@ NUMERIC_ARRAY_KEYS = frozenset(
 
 class ArtifactResumeError(RuntimeError):
     """An existing artifact cannot be proved complete and current."""
+
+
+@contextlib.contextmanager
+def _output_run_lock(output_root: Path) -> Iterator[None]:
+    """Serialize writers for one numeric output directory on the server.
+
+    The lock is advisory and intentionally uses the host's standard POSIX
+    ``flock`` implementation.  Windows/unit-test environments keep the
+    helper as a no-op because the production preparation path runs on Linux.
+    The lock file is metadata only; it is not discovered as an episode
+    artifact and is never removed by the preparation process.
+    """
+
+    if os.name != "posix":
+        yield
+        return
+    import fcntl
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    lock_path = output_root / ".prepare_weaver_dataset.lock"
+    with lock_path.open("a+", encoding="utf-8") as stream:
+        try:
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                stream.seek(0)
+                owner = stream.read().strip() or "owner metadata unavailable"
+                raise ArtifactResumeError(
+                    f"Another prepare_weaver_dataset process owns {lock_path}: {owner}"
+                ) from exc
+            stream.seek(0)
+            stream.truncate()
+            stream.write(f"pid={os.getpid()} host={socket.gethostname()}\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def _resolve_existing_pair(
+    output_root: Path,
+    json_path: Path,
+    npz_path: Path,
+    *,
+    expected_manifest: dict[str, Any],
+    expected_arrays: dict[str, np.ndarray],
+) -> tuple[dict[str, Any], str]:
+    """Resolve an already-visible pair without ever overwriting it.
+
+    A pair can become visible after the initial directory scan (for example,
+    when resuming a run on GPFS).  Such a pair is safe to reuse only after the
+    same strict manifest/array checks used for ordinary resume have passed.
+    Partial or stale pairs remain fail-closed.
+    """
+
+    present = (json_path.exists(), npz_path.exists())
+    if not all(present):
+        if any(present):
+            raise ArtifactResumeError(
+                f"Partial late episode artifact; JSON and NPZ must both exist: {json_path} / {npz_path}"
+            )
+        raise ArtifactResumeError(f"Episode artifact disappeared before validation: {json_path} / {npz_path}")
+    try:
+        manifest = _validate_existing_pair(
+            output_root,
+            json_path,
+            npz_path,
+            expected_manifest=expected_manifest,
+            expected_arrays=expected_arrays,
+        )
+    except ArtifactResumeError as exc:
+        raise ArtifactResumeError(f"Late episode artifact is stale or invalid: {json_path} / {npz_path}: {exc}") from exc
+    return manifest, "reused-late"
 
 
 def _discard_partial_write(path: Path) -> None:
@@ -623,7 +700,7 @@ def _prepare_dataset(args: Args):
     return config, data_factory, dataset, dataset_root
 
 
-def main(args: Args) -> None:
+def _main_unlocked(args: Args) -> None:
     config, data_factory, dataset, dataset_root = _prepare_dataset(args)
     contract = build_r1pro_contract()
     selected_features = _adapter.validate_selected_video_features(
@@ -906,18 +983,26 @@ def main(args: Args) -> None:
                     write_status = "reused"
                 else:
                     if npz_path.exists() or json_path.exists():
-                        raise ArtifactResumeError(f"Orphan or unindexed episode artifact: {npz_path} / {json_path}")
-                    _atomic_write_npz(npz_path, arrays)
-                    manifest["numeric_artifact"].update(
-                        {
-                            "size_bytes": npz_path.stat().st_size,
-                            "sha256": _file_sha256(npz_path),
-                        }
-                    )
-                    _atomic_write_json(json_path, manifest)
-                    persisted_manifest = manifest
-                    existing_pairs[episode_index] = (persisted_manifest, json_path, npz_path)
-                    write_status = "written"
+                        persisted_manifest, write_status = _resolve_existing_pair(
+                            output_root,
+                            json_path,
+                            npz_path,
+                            expected_manifest=manifest,
+                            expected_arrays=arrays,
+                        )
+                        existing_pairs[episode_index] = (persisted_manifest, json_path, npz_path)
+                    else:
+                        _atomic_write_npz(npz_path, arrays)
+                        manifest["numeric_artifact"].update(
+                            {
+                                "size_bytes": npz_path.stat().st_size,
+                                "sha256": _file_sha256(npz_path),
+                            }
+                        )
+                        _atomic_write_json(json_path, manifest)
+                        persisted_manifest = manifest
+                        existing_pairs[episode_index] = (persisted_manifest, json_path, npz_path)
+                        write_status = "written"
                 manifest_index[episode_index] = persisted_manifest
                 _atomic_write_manifest_index(output_root / "manifest.jsonl", manifest_index)
             else:
@@ -976,6 +1061,17 @@ def main(args: Args) -> None:
         _atomic_write_json(output_root / "summary.json", summary)
         _atomic_write_manifest_index(output_root / "manifest.jsonl", manifest_index)
     print(json.dumps(summary, indent=2, ensure_ascii=False), flush=True)
+
+
+def main(args: Args) -> None:
+    """Run preparation with one writer per output directory."""
+
+    if args.dry_run:
+        _main_unlocked(args)
+        return
+    output_root = Path(args.output_dir).expanduser().resolve()
+    with _output_run_lock(output_root):
+        _main_unlocked(args)
 
 
 if __name__ == "__main__":

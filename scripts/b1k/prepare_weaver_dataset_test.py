@@ -263,6 +263,49 @@ def test_complete_pair_is_strictly_reused_and_stale_values_fail(tmp_path):
         )
 
 
+def test_complete_pair_that_appears_after_initial_scan_is_strictly_reused(tmp_path):
+    manifest, arrays, json_path, npz_path = _artifact(tmp_path, episode_index=199)
+
+    # Simulate a pair becoming visible after the startup discovery snapshot.
+    assert prepare._discover_existing_pairs(tmp_path)[199][0] == manifest
+    persisted, status = prepare._resolve_existing_pair(
+        tmp_path,
+        json_path,
+        npz_path,
+        expected_manifest=manifest,
+        expected_arrays=arrays,
+    )
+    assert status == "reused-late"
+    assert persisted == manifest
+
+
+def test_late_partial_pair_remains_fail_closed(tmp_path):
+    manifest, _, json_path, npz_path = _artifact(tmp_path, episode_index=199)
+    npz_path.unlink()
+    with pytest.raises(prepare.ArtifactResumeError, match="Partial late episode artifact"):
+        prepare._resolve_existing_pair(
+            tmp_path,
+            json_path,
+            npz_path,
+            expected_manifest=manifest,
+            expected_arrays={"unused": np.zeros(1)},
+        )
+
+
+def test_late_complete_but_stale_pair_remains_fail_closed(tmp_path):
+    manifest, arrays, json_path, npz_path = _artifact(tmp_path, episode_index=199)
+    stale = {key: np.array(value, copy=True) for key, value in arrays.items()}
+    stale["states"][0, 0] = 1.0
+    with pytest.raises(prepare.ArtifactResumeError, match="Late episode artifact is stale or invalid"):
+        prepare._resolve_existing_pair(
+            tmp_path,
+            json_path,
+            npz_path,
+            expected_manifest=manifest,
+            expected_arrays=stale,
+        )
+
+
 def test_orphan_pair_fails_explicitly(tmp_path):
     orphan = tmp_path / "episodes" / "train" / "000000.npz"
     orphan.parent.mkdir(parents=True)
