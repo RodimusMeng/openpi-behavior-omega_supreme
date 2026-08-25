@@ -255,7 +255,7 @@ def test_30hz_rewards_are_summed_over_each_5hz_transition():
         dataset_repo_id="b1k-v3again",
         dataset_metadata_sha256="a" * 64,
     )
-    assert manifest["reward"]["representation"] == "b1k_behavior_recorded_transition_reward_5hz_v3"
+    assert manifest["reward"]["representation"] == "b1k_behavior_recorded_transition_reward_5hz_v4"
     assert manifest["reward"]["allowed_online_input"] is False
 
 

@@ -203,6 +203,7 @@ def _artifact(root, episode_index: int = 0):
         "raw_state_dim": 61,
     }
     manifest["task_names"] = ["resume test"]
+    manifest["dataset_provenance"] = {}
     manifest["latent_artifact"] = {"complete": False}
     arrays = {
         "index": np.arange(episode_index * 2, episode_index * 2 + 2, dtype=np.int64),
