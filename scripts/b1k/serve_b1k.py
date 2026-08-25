@@ -51,10 +51,14 @@ def main(args: Args) -> None:
     if args.num_flow_steps <= 0:
         raise ValueError(f"num_flow_steps must be positive, got {args.num_flow_steps}")
 
-    # Load task from registry
-    task_bucket, task_name = args.task.split("/")
-    registry_prompt = TASK_REGISTRY[task_bucket][task_name]
-    task_prompt = args.prompt if args.prompt is not None else registry_prompt
+    # An explicit prompt is authoritative. This is required for full-dataset
+    # BEHAVIOR evaluation because the local registry is intentionally only a
+    # small convenience registry, not the official 100-task catalog.
+    if args.prompt is not None:
+        task_prompt = args.prompt
+    else:
+        task_bucket, task_name = args.task.split("/", maxsplit=1)
+        task_prompt = TASK_REGISTRY[task_bucket][task_name]
     # log the prompt used
     logging.info(
         "Using robot: %s, prompt: %s, num_flow_steps: %d",
