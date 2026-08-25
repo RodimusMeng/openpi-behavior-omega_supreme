@@ -103,6 +103,16 @@ treated as a RoboMeter state-progress label. Full-mode windows reserve one
 additional real successor so the terminal sentinel never reaches the frozen
 reward/critic heads.
 
+BEHAVIOR exports can contain an intermediate run of `next.terminated=True`
+before the task's final absorbing suffix. The first marker is therefore not an
+episode boundary: intermediate rows and their recorded rewards remain in the
+source trajectory. The adapter uses only the final contiguous
+terminated/truncated suffix, which must reach the source episode's last row,
+as the boundary. It retains the final terminal transition and the first real
+sampled successor as the terminal target, while rejecting nonzero rewards in
+the remaining absorbing tail. This is fail-closed and applies identically to
+the numeric preparation diagnostics and the training adapter.
+
 For the actual full-data preparation, use the same command without subset
 selection and write to a fresh output directory:
 

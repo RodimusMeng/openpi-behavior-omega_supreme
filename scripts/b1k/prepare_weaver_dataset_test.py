@@ -130,8 +130,24 @@ def test_reward_diagnostics_preserve_span_and_terminal_provenance():
     )
     assert diagnostics["cumulative_span"] == 2.0
     assert diagnostics["first_done_row"] == 1
+    assert diagnostics["terminal_suffix_start_row"] == 1
+    assert diagnostics["intermediate_done_count"] == 0
     assert diagnostics["sampled_terminal_target_row"] == 2
-    assert diagnostics["post_done_max_abs_reward"] == 1.0
+    assert diagnostics["post_terminal_suffix_max_abs_reward"] == 1.0
+
+
+def test_reward_diagnostics_distinguish_intermediate_and_final_terminal_runs():
+    diagnostics = prepare._reward_diagnostics(
+        np.asarray([0.0, 1.0, 0.0, -1.0, 0.0, 1.0, 0.0]),
+        np.asarray([False, True, True, False, False, True, True]),
+        np.zeros(7, dtype=bool),
+        np.asarray([0, 3, 6]),
+    )
+    assert diagnostics["first_done_row"] == 1
+    assert diagnostics["terminal_suffix_start_row"] == 5
+    assert diagnostics["intermediate_done_count"] == 2
+    assert diagnostics["sampled_terminal_target_row"] == 6
+    assert diagnostics["post_terminal_suffix_max_abs_reward"] == 0.0
 
 
 def _artifact(root, episode_index: int = 0):

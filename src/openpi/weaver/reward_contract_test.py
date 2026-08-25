@@ -36,20 +36,26 @@ def test_terminal_marker_accepts_final_pulse_and_absorbing_suffix() -> None:
     np.testing.assert_array_equal(result.transition_valid, [True, True, False])
 
 
-def test_terminal_marker_rejects_non_suffix_or_separated_regions() -> None:
+def test_intermediate_terminal_run_is_preserved_before_final_suffix() -> None:
     rewards = np.zeros(7, dtype=np.float32)
     terminated = np.zeros(7, dtype=bool)
-    terminated[[2, 3, 5]] = True
-    with pytest.raises(ValueError, match="contiguous suffix"):
-        reward_contract.aggregate_progress_rewards(
-            rewards,
-            np.asarray([0, 3, 6]),
-            source_terminated=terminated,
-        )
+    terminated[2:4] = True
+    terminated[6] = True
+    rewards[2] = 1.0
+    rewards[4] = -1.0
+    result = reward_contract.aggregate_progress_rewards(
+        rewards,
+        np.asarray([0, 3, 6]),
+        source_terminated=terminated,
+    )
+    np.testing.assert_allclose(result.rewards, [1.0, -1.0, 0.0])
 
-    terminated[:] = False
+
+def test_terminal_marker_without_final_suffix_is_rejected() -> None:
+    rewards = np.zeros(7, dtype=np.float32)
+    terminated = np.zeros(7, dtype=bool)
     terminated[2:5] = True
-    with pytest.raises(ValueError, match="contiguous suffix"):
+    with pytest.raises(ValueError, match="final row"):
         reward_contract.aggregate_progress_rewards(
             rewards,
             np.asarray([0, 3, 6]),
@@ -57,7 +63,7 @@ def test_terminal_marker_rejects_non_suffix_or_separated_regions() -> None:
         )
 
 
-def test_terminated_and_truncated_union_must_form_one_suffix() -> None:
+def test_terminated_and_truncated_union_uses_final_suffix_boundary() -> None:
     rewards = np.zeros(8, dtype=np.float32)
     terminated = np.zeros(8, dtype=bool)
     truncated = np.zeros(8, dtype=bool)
@@ -75,13 +81,13 @@ def test_terminated_and_truncated_union_must_form_one_suffix() -> None:
     truncated[:] = False
     terminated[2:4] = True
     truncated[5:] = True
-    with pytest.raises(ValueError, match="contiguous suffix"):
-        reward_contract.aggregate_progress_rewards(
-            rewards,
-            np.asarray([0, 3, 7]),
-            source_terminated=terminated,
-            source_truncated=truncated,
-        )
+    result = reward_contract.aggregate_progress_rewards(
+        rewards,
+        np.asarray([0, 3, 7]),
+        source_terminated=terminated,
+        source_truncated=truncated,
+    )
+    np.testing.assert_array_equal(result.transition_valid, [True, True, False])
 
 
 def test_accepts_behavior_style_long_absorbing_suffix() -> None:
@@ -96,7 +102,7 @@ def test_accepts_behavior_style_long_absorbing_suffix() -> None:
     np.testing.assert_array_equal(result.transition_valid, [True, True, True, False])
 
 
-def test_rejects_nonzero_reward_after_first_terminal_transition() -> None:
+def test_rejects_nonzero_reward_after_final_terminal_transition() -> None:
     rewards = np.zeros(8, dtype=np.float32)
     rewards[6] = 0.25
     terminated = np.zeros(8, dtype=bool)

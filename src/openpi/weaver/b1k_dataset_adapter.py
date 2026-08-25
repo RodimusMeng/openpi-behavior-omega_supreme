@@ -27,7 +27,7 @@ from openpi.weaver.b1k_contract import B1KWeaverContract
 from openpi.weaver.b1k_contract import build_r1pro_contract
 from openpi.weaver.b1k_contract import world_model_frame_indices
 
-SCHEMA_VERSION = "b1k_weaver_episode_v4"
+SCHEMA_VERSION = "b1k_weaver_episode_v5"
 POLICY_ACTION_REPRESENTATION = "b1k_policy_mixed_v1"
 STATE_DELTA_ACTION_REPRESENTATION = "r1pro_compact_state_delta_v1"
 TRAINING_ACTION_CONTRACT = {
@@ -348,13 +348,12 @@ def adapt_episode(
             if marker.ndim != 1 or marker.shape[0] != source_length or marker.dtype != np.bool_:
                 raise ValueError(f"{name} must be a boolean vector matching the source episode")
             done |= marker
-        done_positions = np.flatnonzero(done)
-        if done_positions.size:
-            first_done = int(done_positions[0])
-            terminal_target = int(np.searchsorted(frame_indices, first_done + 1, side="left"))
+        terminal_suffix = _reward_contract.terminal_suffix_start(done)
+        if terminal_suffix is not None:
+            terminal_target = int(np.searchsorted(frame_indices, terminal_suffix + 1, side="left"))
             if terminal_target >= frame_indices.size:
                 raise ValueError(
-                    f"Episode {episode_index} has its first terminal transition at source row {first_done}, "
+                    f"Episode {episode_index} has its final terminal suffix starting at source row {terminal_suffix}, "
                     "but no later 5 Hz observation exists to represent its outcome"
                 )
             frame_indices = frame_indices[: terminal_target + 1]

@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 
-REWARD_REPRESENTATION = "b1k_behavior_recorded_transition_reward_5hz_v2"
+REWARD_REPRESENTATION = "b1k_behavior_recorded_transition_reward_5hz_v3"
 REWARD_CONTRACT = {
     "representation": REWARD_REPRESENTATION,
     "alignment": "sum_next_reward_over_source_rows_i_to_j_exclusive",
@@ -24,7 +24,7 @@ REWARD_CONTRACT = {
     "state_aligned": False,
     "transition_aligned": True,
     "terminal_row_valid": False,
-    "terminal_marker_semantics": "optional_absorbing_suffix",
+    "terminal_marker_semantics": "intermediate_runs_plus_final_absorbing_suffix",
     "privileged_offline_label": True,
     "allowed_online_input": False,
 }
@@ -36,6 +36,36 @@ class AggregatedRewards:
 
     rewards: np.ndarray
     transition_valid: np.ndarray
+
+
+def terminal_suffix_start(done: Any) -> int | None:
+    """Return the start of the final terminal/timeout suffix.
+
+    BEHAVIOR exports can contain an intermediate run of terminal markers and
+    then continue the same episode (as in episode 147 of v3again).  Such runs
+    are retained as ordinary source transitions.  The only marker that
+    defines the episode boundary is the final contiguous run reaching the
+    source episode's last row.  A marker that does not reach the final row is
+    rejected because no authoritative episode boundary can be established.
+    """
+
+    array = np.asarray(done)
+    if array.ndim == 2 and array.shape[1] == 1:
+        array = array[:, 0]
+    if array.ndim != 1 or array.dtype != np.bool_:
+        raise ValueError(f"done must be a boolean vector, got {array.shape}/{array.dtype}")
+    positions = np.flatnonzero(array)
+    if positions.size == 0:
+        return None
+    if not bool(array[-1]):
+        raise ValueError(
+            "Termination/truncation markers must include the source episode's final row; "
+            f"got {positions.tolist()}"
+        )
+    suffix_start = int(positions[-1])
+    while suffix_start > 0 and bool(array[suffix_start - 1]):
+        suffix_start -= 1
+    return suffix_start
 
 
 def aggregate_progress_rewards(
@@ -128,24 +158,19 @@ def _optional_bool_vector(value: Any | None, *, length: int, name: str) -> np.nd
 def _validate_terminal_suffix(done: np.ndarray, *, rewards: np.ndarray, tolerance: float) -> None:
     """Validate BEHAVIOR's terminal convention.
 
-    Dataset exports may repeat ``terminated``/``truncated`` on every row of
-    the absorbing suffix after the task finishes.  This is equivalent to a
-    single terminal event for transition alignment.  We accept no marker, a
-    final-row pulse, or one contiguous suffix, while rejecting markers that
-    resume or contain multiple separated regions.
+    Dataset exports may contain intermediate terminal runs before the final
+    absorbing suffix.  Those rows remain part of the source trajectory.  The
+    final suffix is the only boundary, and repeated rows after its first row
+    must carry zero reward.
     """
 
-    done_positions = np.flatnonzero(done)
-    if done_positions.size == 0:
+    suffix_start = terminal_suffix_start(done)
+    if suffix_start is None:
         return
-    first = int(done_positions[0])
-    if not np.all(done[first:]):
+    if suffix_start + 1 < rewards.size and not np.allclose(
+        rewards[suffix_start + 1 :], 0.0, rtol=0.0, atol=tolerance
+    ):
         raise ValueError(
-            "Termination/truncation markers must form one contiguous suffix "
-            f"starting at row {first}; got {done_positions.tolist()}"
-        )
-    if first + 1 < rewards.size and not np.allclose(rewards[first + 1 :], 0.0, rtol=0.0, atol=tolerance):
-        raise ValueError(
-            "Repeated terminal/absorbing rows must have zero recorded reward after the first terminal transition; "
-            f"nonzero suffix starts at row {first + 1}"
+            "Repeated terminal/absorbing rows must have zero recorded reward after the final terminal transition; "
+            f"nonzero suffix starts at row {suffix_start + 1}"
         )

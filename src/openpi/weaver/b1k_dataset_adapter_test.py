@@ -255,12 +255,12 @@ def test_30hz_rewards_are_summed_over_each_5hz_transition():
         dataset_repo_id="b1k-v3again",
         dataset_metadata_sha256="a" * 64,
     )
-    assert manifest["reward"]["representation"] == "b1k_behavior_recorded_transition_reward_5hz_v2"
+    assert manifest["reward"]["representation"] == "b1k_behavior_recorded_transition_reward_5hz_v3"
     assert manifest["reward"]["allowed_online_input"] is False
 
 
 def test_terminal_suffix_is_cropped_after_terminal_target_and_keeps_target_observation():
-    """Only the interval containing the first done may remain in a WEAVER episode.
+    """Only the interval containing the final done suffix may remain.
 
     The LeRobot row carrying ``done`` is the transition *into* the next
     observation.  Consequently the adapter keeps the first sampled frame at
@@ -293,6 +293,31 @@ def test_terminal_suffix_is_cropped_after_terminal_target_and_keeps_target_obser
     assert episode.policy_actions_at_frame[-1, 0] == pytest.approx(policy_actions[18, 0])
 
 
+def test_intermediate_terminal_run_does_not_crop_episode_or_drop_rewards():
+    timestamps, raw_states, policy_actions = _synthetic_episode(31)
+    terminated = np.zeros(31, dtype=bool)
+    terminated[13:16] = True
+    terminated[24:] = True
+    rewards = np.zeros(31, dtype=np.float32)
+    rewards[13] = 1.0
+    rewards[16] = -1.0
+    rewards[24] = 1.0
+
+    episode = adapter.adapt_episode(
+        episode_index=147,
+        prompt="intermediate terminal run",
+        timestamps_s=timestamps,
+        raw_states=raw_states,
+        policy_actions=policy_actions,
+        rewards=rewards,
+        terminated=terminated,
+    )
+
+    np.testing.assert_array_equal(episode.source_frame_indices, [0, 6, 12, 18, 24, 30])
+    np.testing.assert_allclose(episode.rewards, [0.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+    np.testing.assert_array_equal(episode.transition_valid, [True, True, True, True, True, False])
+
+
 def test_terminal_transition_without_a_later_observation_is_rejected():
     timestamps, raw_states, policy_actions = _synthetic_episode(31)
     terminated = np.zeros(31, dtype=bool)
@@ -315,7 +340,7 @@ def test_nonzero_reward_after_absorbing_terminal_suffix_is_rejected():
     terminated[13:] = True
     rewards = np.zeros(31, dtype=np.float32)
     rewards[20] = 1.0
-    with pytest.raises(ValueError, match="zero recorded reward after the first terminal"):
+    with pytest.raises(ValueError, match="zero recorded reward after the final terminal"):
         adapter.adapt_episode(
             episode_index=0,
             prompt="bad terminal reward",

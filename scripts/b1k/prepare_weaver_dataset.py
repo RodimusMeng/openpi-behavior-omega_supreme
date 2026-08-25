@@ -299,12 +299,13 @@ def _reward_diagnostics(
     done = term | trunc
     done_positions = np.flatnonzero(done)
     first_done = int(done_positions[0]) if done_positions.size else None
+    terminal_suffix_start = _reward_contract.terminal_suffix_start(done)
     first_term = int(np.flatnonzero(term)[0]) if np.any(term) else None
     first_trunc = int(np.flatnonzero(trunc)[0]) if np.any(trunc) else None
     cumulative = np.concatenate(([0.0], np.cumsum(values, dtype=np.float64)))
     terminal_target = None
-    if first_done is not None:
-        target = int(np.searchsorted(sampled_frame_indices, first_done + 1, side="left"))
+    if terminal_suffix_start is not None:
+        target = int(np.searchsorted(sampled_frame_indices, terminal_suffix_start + 1, side="left"))
         terminal_target = int(sampled_frame_indices[target]) if target < len(sampled_frame_indices) else None
     # The transition at the final sampled observation has no sampled successor,
     # so it is part of the unrepresentable tail as well.
@@ -319,8 +320,14 @@ def _reward_diagnostics(
         "first_terminated_row": first_term,
         "first_truncated_row": first_trunc,
         "first_done_row": first_done,
-        "post_done_max_abs_reward": float(np.max(np.abs(values[first_done + 1 :]), initial=0.0))
-        if first_done is not None
+        "terminal_suffix_start_row": terminal_suffix_start,
+        "intermediate_done_count": int(np.count_nonzero(done[:terminal_suffix_start]))
+        if terminal_suffix_start is not None
+        else 0,
+        "post_terminal_suffix_max_abs_reward": float(
+            np.max(np.abs(values[terminal_suffix_start + 1 :]), initial=0.0)
+        )
+        if terminal_suffix_start is not None
         else 0.0,
         "sampled_terminal_target_row": terminal_target,
         "unsampled_tail_count": int(tail.size),
