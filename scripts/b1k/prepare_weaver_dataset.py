@@ -52,6 +52,15 @@ class ArtifactResumeError(RuntimeError):
     """An existing artifact cannot be proved complete and current."""
 
 
+def _discard_partial_write(path: Path) -> None:
+    """Best-effort cleanup without masking the original write failure."""
+
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 @dataclasses.dataclass(frozen=True)
 class Args:
     config_name: str = "pi05_b1k_full"
@@ -339,22 +348,30 @@ def _reward_diagnostics(
 def _atomic_write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    with temporary.open("w", encoding="utf-8", newline="\n") as stream:
-        json.dump(value, stream, indent=2, sort_keys=True, ensure_ascii=False)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+            json.dump(value, stream, indent=2, sort_keys=True, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        _discard_partial_write(temporary)
+        raise
 
 
 def _atomic_write_npz(path: Path, arrays: dict[str, np.ndarray]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    with temporary.open("wb") as stream:
-        np.savez_compressed(stream, **arrays)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    try:
+        with temporary.open("wb") as stream:
+            np.savez_compressed(stream, **arrays)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        _discard_partial_write(temporary)
+        raise
 
 
 def _file_sha256(path: Path) -> str:
@@ -368,12 +385,16 @@ def _file_sha256(path: Path) -> str:
 def _atomic_write_manifest_index(path: Path, manifests: dict[int, dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    with temporary.open("w", encoding="utf-8", newline="\n") as stream:
-        for episode_index in sorted(manifests):
-            stream.write(json.dumps(manifests[episode_index], sort_keys=True, ensure_ascii=False) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+            for episode_index in sorted(manifests):
+                stream.write(json.dumps(manifests[episode_index], sort_keys=True, ensure_ascii=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        _discard_partial_write(temporary)
+        raise
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:

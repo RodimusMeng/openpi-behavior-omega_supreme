@@ -268,6 +268,19 @@ def test_manifest_index_is_atomically_refreshed_after_each_episode(tmp_path):
     assert [json.loads(line)["episode_index"] for line in index_path.read_text().splitlines()] == [0, 1]
 
 
+def test_atomic_npz_write_removes_partial_temp_after_failure(tmp_path, monkeypatch):
+    target = tmp_path / "episodes" / "train" / "000000.npz"
+    temporary = target.with_name(f".{target.name}.tmp-{prepare.os.getpid()}")
+
+    def fail_save(*args, **kwargs):
+        raise OSError("synthetic quota exhaustion")
+
+    monkeypatch.setattr(prepare.np, "savez_compressed", fail_save)
+    with pytest.raises(OSError, match="quota exhaustion"):
+        prepare._atomic_write_npz(target, {"value": np.zeros(1, dtype=np.float32)})
+    assert not temporary.exists()
+
+
 def test_subset_resume_rejects_stale_unselected_pair_before_building_global_index(tmp_path):
     current, _, _, _ = _artifact(tmp_path, episode_index=0)
     stale, _, stale_json, _ = _artifact(tmp_path, episode_index=1)
