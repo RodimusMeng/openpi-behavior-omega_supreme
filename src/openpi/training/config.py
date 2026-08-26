@@ -14,6 +14,7 @@ from typing_extensions import override
 import tyro
 
 from openpi.configs import ROBOT_REGISTRY
+from openpi.configs.robots.base_config import build_delta_action_mappings
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
@@ -379,42 +380,30 @@ class LeRobotB1KDataConfig(DataConfigFactory):
     action_sequence_keys: Sequence[str] = ("action",)
 
     def _build_delta_mappings(self, robot_config) -> list[tuple[list[int], list[int]]]:
-        state_slices = []
-        state_offset = 0
-        for proprio_config in robot_config.proprio:
-            dim = 1 if proprio_config.is_eef else len(proprio_config.indices)
-            state_slices.append(list(range(state_offset, state_offset + dim)))
-            state_offset += dim
-
-        mappings = []
-        state_slice_index = 0
-        for action_config in robot_config.action:
-            if action_config.is_eef or not action_config.needs_delta_comp:
-                continue
-            action_dim = len(action_config.indices)
-            while state_slice_index < len(state_slices) and len(state_slices[state_slice_index]) != action_dim:
-                state_slice_index += 1
-            if state_slice_index >= len(state_slices):
-                raise ValueError(
-                    f"Could not find a state slice for delta action group {action_config.name!r} "
-                    f"with dim {action_dim} in robot config {robot_config.robot_type!r}."
-                )
-            mappings.append((action_config.indices, state_slices[state_slice_index]))
-            state_slice_index += 1
-        return mappings
+        return [
+            (list(action), list(state))
+            for action, state in build_delta_action_mappings(robot_config)
+        ]
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         robot_config = ROBOT_REGISTRY[self.robot_config_name]
+        base_config = self.create_base_config(assets_dirs, model_config)
 
-        # Build repack mapping dynamically based on available observations
+        # Build repack mapping dynamically based on available RGB observations.
         repack_mapping = {}
-        for i in range(3):  # Support up to 3 cameras (image_0, image_1, image_2)
-            image_key = f"image_{i}"
-            if image_key in robot_config.observations:
-                repack_mapping[f"observation/{image_key}"] = robot_config.observations[image_key].dataset_key
+        video_keys = []
 
-        # Add non-image observations
+        for i in range(3):
+            image_key = f"image_{i}"
+            observation = robot_config.observations.get(image_key)
+            if observation is None:
+                continue
+
+            repack_mapping[f"observation/{image_key}"] = observation.dataset_key
+            video_keys.append(observation.dataset_key)
+
+        # Add non-image observations.
         repack_mapping.update(
             {
                 "observation/state": "observation.state",
@@ -423,16 +412,20 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             }
         )
 
-        repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_mapping)])
+        repack_transform = _transforms.Group(
+            inputs=[_transforms.RepackTransform(repack_mapping)]
+        )
 
-        # Prepare data for policy training
-        # Convert images to uint8 numpy arrays, add masks
         data_transforms = _transforms.Group(
-            inputs=[b1k_policy.B1KInputs(robot_config=robot_config, model_type=model_config.model_type)],
+            inputs=[
+                b1k_policy.B1KInputs(
+                    robot_config=robot_config,
+                    model_type=model_config.model_type,
+                )
+            ],
             outputs=[b1k_policy.B1KOutputs(action_dim=robot_config.action_dim)],
         )
 
-        # extra delta transform.
         if self.extra_delta_transform:
             delta_mappings = self._build_delta_mappings(robot_config)
 
@@ -441,20 +434,20 @@ class LeRobotB1KDataConfig(DataConfigFactory):
                 outputs=[_transforms.MappedAbsoluteActions(delta_mappings)],
             )
 
-        # Model transforms include things like tokenizing the prompt and action targets
-        # You do not need to change anything here for your own dataset.
         model_transforms = ModelTransformFactory()(model_config)
 
-        # We return all data transforms for training and inference. No need to change anything here.
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            base_config,
+            dataset_kwargs={
+                **base_config.dataset_kwargs,
+                "video_keys": video_keys,
+            },
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=(robot_config.action_key,),
             use_quantile_norm=False,
         )
-
 
 @dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
@@ -770,6 +763,7 @@ _CONFIGS = [
                 prompt_from_task=True,
                 dataset_kwargs={
                     "tolerance_s": 5e-4,
+                    "video_backend": "pyav",
                 },
             ),
             robot_config_name="b1k/R1Pro",

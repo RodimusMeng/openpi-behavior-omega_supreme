@@ -50,14 +50,17 @@ def main(args: Args) -> None:
     if args.num_flow_steps <= 0:
         raise ValueError(f"num_flow_steps must be positive, got {args.num_flow_steps}")
 
-    # Load task from registry
-    task_bucket, task_name = args.task.split("/")
-    registry_prompt = TASK_REGISTRY[task_bucket][task_name]
-    task_prompt = args.prompt if args.prompt is not None else registry_prompt
-    # log the prompt used
+    if args.prompt is not None:
+        task_prompt = args.prompt
+    else:
+        task_bucket, task_name = args.task.split("/", maxsplit=1)
+        task_prompt = TASK_REGISTRY[task_bucket][task_name]
+
     logging.info(
         "Using robot: %s, prompt: %s, num_flow_steps: %d",
-        args.robot, task_prompt, args.num_flow_steps,
+        args.robot,
+        task_prompt,
+        args.num_flow_steps,
     )
     
     # Load training config and override request-specific fields.

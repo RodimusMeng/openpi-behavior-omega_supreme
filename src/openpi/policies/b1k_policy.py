@@ -6,6 +6,7 @@ import numpy as np
 from openpi import transforms
 from openpi.models import model as _model
 from openpi.configs.robots.base_config import RobotConfig
+from openpi.configs.robots.base_config import extract_compact_state
 
 
 def make_b1k_example() -> dict:
@@ -31,14 +32,7 @@ def extract_state_from_proprio(proprio_data, robot_config: RobotConfig) -> np.nd
     Returns:
         Extracted state array
     """
-    state = []
-    for proprio in robot_config.proprio:
-        if proprio.is_eef:
-            # Sum the gripper finger positions to get a single width value
-            state.append(proprio_data[..., proprio.indices].sum(axis=-1, keepdims=True))
-        else:
-            state.append(proprio_data[..., proprio.indices])
-    return np.concatenate(state, axis=-1)
+    return extract_compact_state(proprio_data, robot_config)
 
 
 def _parse_image(image) -> np.ndarray:

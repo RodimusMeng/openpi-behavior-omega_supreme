@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+import numpy as np
+
 
 # Global registry for robot configurations
 ROBOT_REGISTRY: Dict[str, "RobotConfig"] = {}
@@ -81,3 +83,57 @@ class RobotConfig:
                 f"action_dim ({self.action_dim})"
             )
 
+def state_output_slices(robot_config: RobotConfig) -> list[tuple[int, ...]]:
+    """Return each configured proprio group in the compact policy-state space."""
+    slices: list[tuple[int, ...]] = []
+    offset = 0
+    for proprio_config in robot_config.proprio:
+        width = 1 if proprio_config.is_eef else len(proprio_config.indices)
+        slices.append(tuple(range(offset, offset + width)))
+        offset += width
+    return slices
+
+
+def extract_compact_state(raw_proprio: np.ndarray, robot_config: RobotConfig) -> np.ndarray:
+    """Extract the compact policy state described by RobotConfig.proprio."""
+    raw_proprio = np.asarray(raw_proprio)
+    components = []
+    for proprio_config in robot_config.proprio:
+        component = raw_proprio[..., proprio_config.indices]
+        if proprio_config.is_eef:
+            component = component.sum(axis=-1, keepdims=True)
+        components.append(component)
+    return np.concatenate(components, axis=-1)
+
+
+def build_delta_action_mappings(
+    robot_config: RobotConfig,
+) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:
+    """Build mappings used by the selective B1K delta transform."""
+    state_slices = state_output_slices(robot_config)
+    mappings: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+    state_slice_index = 0
+
+    for action_config in robot_config.action:
+        if action_config.is_eef or not action_config.needs_delta_comp:
+            continue
+
+        action_indices = tuple(action_config.indices)
+
+        while (
+            state_slice_index < len(state_slices)
+            and len(state_slices[state_slice_index]) != len(action_indices)
+        ):
+            state_slice_index += 1
+
+        if state_slice_index >= len(state_slices):
+            raise ValueError(
+                f"Could not find a state slice for delta action group "
+                f"{action_config.name!r} with dim {len(action_indices)} "
+                f"in robot config {robot_config.robot_type!r}."
+            )
+
+        mappings.append((action_indices, state_slices[state_slice_index]))
+        state_slice_index += 1
+
+    return mappings
