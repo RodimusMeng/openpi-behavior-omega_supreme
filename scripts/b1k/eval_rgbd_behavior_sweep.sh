@@ -4,6 +4,10 @@ set -Eeuo pipefail
 # Pure OpenPI RGBD checkpoint evaluation on the official BEHAVIOR-1K evaluator.
 # Run it from the BEHAVIOR environment after `behavioron` and after exporting
 # OPENPI_ROOT, B1K_ROOT, OPENPI_CONFIG, OPENPI_POLICY_CHECKPOINT, and EVAL_ROOT.
+# export BEHAVIOR_EVAL_INSTANCE_INDICES="0 1 2 3 4"
+# export BEHAVIOR_EVAL_WRITE_VIDEO=1
+# export ROLLOUTS=1                         # 可选，每个实例跑 1 次
+# bash "$OPENPI_ROOT/scripts/b1k/eval_rgbd_behavior_sweep.sh"
 
 : "${OPENPI_ROOT:?export OPENPI_ROOT=/path/to/openpi}"
 : "${B1K_ROOT:?export B1K_ROOT=/path/to/BEHAVIOR-1K}"
