@@ -10,15 +10,16 @@ provenance for later caches to reject stale or incompatible artifacts.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 import contextlib
 import dataclasses
 import hashlib
 import json
 import math
 import os
-import socket
-from collections.abc import Iterator
 from pathlib import Path
+import socket
+import time
 from typing import Any
 
 import numpy as np
@@ -677,6 +678,148 @@ def _episode_rows(dataset: Any, episode: dict[str, Any], columns: tuple[str, ...
     return rows, start, end
 
 
+def _prepare_episode_payload(
+    *,
+    dataset: Any,
+    episode_index: int,
+    episode_row: dict[str, Any],
+    columns: tuple[str, ...],
+    prompt: str,
+    task_names: tuple[str, ...],
+    split: str,
+    dataset_repo_id: str,
+    dataset_metadata_sha256: str,
+    dataset_provenance: dict[str, Any],
+    source_fps: float,
+    target_hz: float,
+    min_sampled_frames: int,
+    include_depth: bool,
+    contract: Any,
+) -> dict[str, Any]:
+    """Build the canonical episode manifest and arrays for every runtime."""
+
+    started = time.perf_counter()
+    rows, source_start, source_end = _episode_rows(dataset, episode_row, columns)
+    read_done = time.perf_counter()
+    row_episode_indices = _to_numpy(rows["episode_index"], name="episode_index").reshape(-1)
+    if row_episode_indices.size != source_end - source_start or not np.all(row_episode_indices == episode_index):
+        raise ValueError(
+            f"Episode row range [{source_start},{source_end}) contains other episode indices: "
+            f"{np.unique(row_episode_indices).tolist()}"
+        )
+    timestamps = _to_numpy(rows["timestamp"], name="timestamp").reshape(-1)
+    raw_states = _to_numpy(rows["observation.state"], name="observation.state")
+    policy_actions = _to_numpy(rows[contract.robot.action_key], name=contract.robot.action_key)
+    source_rewards = _to_numpy(rows["next.reward"], name="next.reward")
+    source_terminated = _to_numpy(rows["next.terminated"], name="next.terminated")
+    source_truncated = _to_numpy(rows["next.truncated"], name="next.truncated")
+    source_length = source_end - source_start
+    source_indices = _authoritative_index_column(
+        rows["index"], name="index", expected=np.arange(source_start, source_end, dtype=np.int64)
+    )
+    source_frame_indices = _authoritative_index_column(
+        rows["frame_index"], name="frame_index", expected=np.arange(source_length, dtype=np.int64)
+    )
+    converted_done = time.perf_counter()
+    adapted = _adapter.adapt_episode(
+        episode_index=episode_index,
+        prompt=prompt,
+        timestamps_s=timestamps,
+        raw_states=raw_states,
+        policy_actions=policy_actions,
+        rewards=source_rewards,
+        terminated=source_terminated,
+        truncated=source_truncated,
+        target_hz=target_hz,
+        min_sampled_frames=min_sampled_frames,
+        contract=contract,
+    )
+    adapted_done = time.perf_counter()
+    reward_diagnostics = _reward_diagnostics(
+        source_rewards, source_terminated, source_truncated, adapted.source_frame_indices
+    )
+    reward_done = time.perf_counter()
+    manifest = _adapter.episode_manifest(
+        adapted,
+        split=split,
+        dataset_repo_id=dataset_repo_id,
+        dataset_metadata_sha256=dataset_metadata_sha256,
+        include_depth=include_depth,
+        contract=contract,
+    )
+    manifest.update(
+        {
+            "source": {
+                "dataset_from_index": source_start,
+                "dataset_to_index": source_end,
+                "source_fps": source_fps,
+                "full_rate_count": source_length,
+                "full_rate_columns": {
+                    "index": "index",
+                    "frame_index": "frame_index",
+                    "timestamp": "source_timestamps_s",
+                    "policy_action": "source_policy_actions",
+                    "next.reward": "source_rewards",
+                    "next.terminated": "source_terminated",
+                    "next.truncated": "source_truncated",
+                },
+                "policy_action_aggregation_5hz": "undefined",
+                "raw_state_dim": int(raw_states.shape[-1]),
+            },
+            "task_names": list(task_names),
+            "prompt_source": "official_meta_tasks_catalog",
+            "dataset_provenance": dataset_provenance,
+            "reward_diagnostics": reward_diagnostics,
+            "numeric_artifact": {"complete": True},
+            "latent_artifact": {"complete": False},
+        }
+    )
+    sampled_offsets = adapted.source_frame_indices
+    sampled_frame_indices = source_frame_indices[sampled_offsets]
+    if not np.array_equal(sampled_frame_indices, sampled_offsets):
+        raise ValueError("Authoritative frame_index does not match the adapter's episode-local offsets")
+    arrays = {
+        "index": source_indices,
+        "frame_index": source_frame_indices,
+        "source_timestamps_s": timestamps,
+        "source_policy_actions": policy_actions,
+        "source_rewards": source_rewards,
+        "source_terminated": source_terminated,
+        "source_truncated": source_truncated,
+        "source_frame_indices": sampled_frame_indices,
+        "source_absolute_indices": source_indices[sampled_offsets],
+        "timestamps_s": adapted.timestamps_s,
+        "timing_errors_s": adapted.timing_errors_s,
+        "states": adapted.states,
+        "state_delta_actions": adapted.state_delta_actions,
+        "policy_actions_at_frame": adapted.policy_actions_at_frame,
+        "transition_valid": adapted.transition_valid,
+        "rewards": adapted.rewards,
+    }
+    relative_npz = Path("episodes") / split / f"{episode_index:06d}.npz"
+    manifest["numeric_artifact"].update({"path": relative_npz.as_posix(), "keys": sorted(arrays)})
+    built_done = time.perf_counter()
+    return {
+        "manifest": manifest,
+        "arrays": arrays,
+        "source_start": source_start,
+        "source_end": source_end,
+        "sampled_count": len(adapted.timestamps_s),
+        "raw_state_shape": tuple(raw_states.shape),
+        "policy_action_shape": tuple(policy_actions.shape),
+        "weaver_state_shape": tuple(adapted.states.shape),
+        "weaver_action_shape": tuple(adapted.state_delta_actions.shape),
+        "max_dt_error": float(adapted.timing_errors_s.max(initial=0.0)),
+        "timings": {
+            "dataset_read_seconds": read_done - started,
+            "numpy_conversion_seconds": converted_done - read_done,
+            "adapter_seconds": adapted_done - converted_done,
+            "reward_validation_seconds": reward_done - adapted_done,
+            "manifest_build_seconds": built_done - reward_done,
+        },
+    }
+
+
 def _prepare_dataset(args: Args):
     config = _config.get_config(args.config_name)
     data_factory = config.data
@@ -701,6 +844,7 @@ def _prepare_dataset(args: Args):
 
 
 def _main_unlocked(args: Args) -> None:
+    run_started = time.perf_counter()
     config, data_factory, dataset, dataset_root = _prepare_dataset(args)
     contract = build_r1pro_contract()
     selected_features = _adapter.validate_selected_video_features(
@@ -851,121 +995,34 @@ def _main_unlocked(args: Args) -> None:
     manifest_index = {episode_index: pair[0] for episode_index, pair in existing_pairs.items()}
     manifests: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
+    aggregate_timings: dict[str, float] = {}
+    episode_loop_started = time.perf_counter()
     for ordinal, episode_index in enumerate(selected_indices, start=1):
         episode_row = all_episode_rows[episode_index]
         try:
-            rows, source_start, source_end = _episode_rows(dataset, episode_row, columns)
-            row_episode_indices = _to_numpy(rows["episode_index"], name="episode_index").reshape(-1)
-            if row_episode_indices.size != source_end - source_start or not np.all(
-                row_episode_indices == episode_index
-            ):
-                raise ValueError(
-                    f"Episode row range [{source_start},{source_end}) contains other episode indices: "
-                    f"{np.unique(row_episode_indices).tolist()}"
-                )
-            timestamps = _to_numpy(rows["timestamp"], name="timestamp").reshape(-1)
-            raw_states = _to_numpy(rows["observation.state"], name="observation.state")
-            policy_actions = _to_numpy(rows[contract.robot.action_key], name=contract.robot.action_key)
-            source_rewards = _to_numpy(rows["next.reward"], name="next.reward")
-            source_terminated = _to_numpy(rows["next.terminated"], name="next.terminated")
-            source_truncated = _to_numpy(rows["next.truncated"], name="next.truncated")
-            source_length = source_end - source_start
-            source_indices = _authoritative_index_column(
-                rows["index"],
-                name="index",
-                expected=np.arange(source_start, source_end, dtype=np.int64),
-            )
-            source_frame_indices = _authoritative_index_column(
-                rows["frame_index"],
-                name="frame_index",
-                expected=np.arange(source_length, dtype=np.int64),
-            )
-            adapted = _adapter.adapt_episode(
+            payload = _prepare_episode_payload(
+                dataset=dataset,
                 episode_index=episode_index,
                 prompt=episode_prompts[episode_index],
-                timestamps_s=timestamps,
-                raw_states=raw_states,
-                policy_actions=policy_actions,
-                rewards=source_rewards,
-                terminated=source_terminated,
-                truncated=source_truncated,
-                target_hz=args.target_hz,
-                min_sampled_frames=args.min_sampled_frames,
-                contract=contract,
-            )
-            reward_diagnostics = _reward_diagnostics(
-                source_rewards,
-                source_terminated,
-                source_truncated,
-                adapted.source_frame_indices,
-            )
-            split = splits[episode_index]
-            manifest = _adapter.episode_manifest(
-                adapted,
-                split=split,
+                episode_row=episode_row,
+                columns=columns,
+                task_names=episode_tasks[episode_index],
+                split=splits[episode_index],
                 dataset_repo_id=str(data_factory.repo_id),
                 dataset_metadata_sha256=metadata_sha256,
+                dataset_provenance=dataset_provenance,
+                source_fps=float(dataset.fps),
+                target_hz=args.target_hz,
+                min_sampled_frames=args.min_sampled_frames,
                 include_depth=args.include_depth,
                 contract=contract,
             )
-            manifest.update(
-                {
-                    "source": {
-                        "dataset_from_index": source_start,
-                        "dataset_to_index": source_end,
-                        "source_fps": dataset.fps,
-                        "full_rate_count": source_length,
-                        "full_rate_columns": {
-                            "index": "index",
-                            "frame_index": "frame_index",
-                            "timestamp": "source_timestamps_s",
-                            "policy_action": "source_policy_actions",
-                            "next.reward": "source_rewards",
-                            "next.terminated": "source_terminated",
-                            "next.truncated": "source_truncated",
-                        },
-                        "policy_action_aggregation_5hz": "undefined",
-                        "raw_state_dim": int(raw_states.shape[-1]),
-                    },
-                    "task_names": list(episode_tasks[episode_index]),
-                    "prompt_source": "official_meta_tasks_catalog",
-                    "dataset_provenance": dataset_provenance,
-                    "reward_diagnostics": reward_diagnostics,
-                    "numeric_artifact": {"complete": True},
-                    "latent_artifact": {"complete": False},
-                }
-            )
-
-            relative_npz = Path("episodes") / split / f"{episode_index:06d}.npz"
+            manifest = payload["manifest"]
+            arrays = payload["arrays"]
+            timings = dict(payload["timings"])
+            split = splits[episode_index]
+            relative_npz = Path(manifest["numeric_artifact"]["path"])
             relative_json = relative_npz.with_suffix(".json")
-            sampled_offsets = adapted.source_frame_indices
-            sampled_frame_indices = source_frame_indices[sampled_offsets]
-            if not np.array_equal(sampled_frame_indices, sampled_offsets):
-                raise ValueError("Authoritative frame_index does not match the adapter's episode-local offsets")
-            arrays = {
-                "index": source_indices,
-                "frame_index": source_frame_indices,
-                "source_timestamps_s": timestamps,
-                "source_policy_actions": policy_actions,
-                "source_rewards": source_rewards,
-                "source_terminated": source_terminated,
-                "source_truncated": source_truncated,
-                "source_frame_indices": sampled_frame_indices,
-                "source_absolute_indices": source_indices[sampled_offsets],
-                "timestamps_s": adapted.timestamps_s,
-                "timing_errors_s": adapted.timing_errors_s,
-                "states": adapted.states,
-                "state_delta_actions": adapted.state_delta_actions,
-                "policy_actions_at_frame": adapted.policy_actions_at_frame,
-                "transition_valid": adapted.transition_valid,
-                "rewards": adapted.rewards,
-            }
-            manifest["numeric_artifact"].update(
-                {
-                    "path": relative_npz.as_posix(),
-                    "keys": sorted(arrays),
-                }
-            )
             write_status = "dry-run"
             if not args.dry_run:
                 npz_path = output_root / relative_npz
@@ -973,6 +1030,7 @@ def _main_unlocked(args: Args) -> None:
                 existing = existing_pairs.get(episode_index)
                 if existing is not None:
                     _, existing_json_path, existing_npz_path = existing
+                    operation_started = time.perf_counter()
                     persisted_manifest = _validate_existing_pair(
                         output_root,
                         existing_json_path,
@@ -980,41 +1038,53 @@ def _main_unlocked(args: Args) -> None:
                         expected_manifest=manifest,
                         expected_arrays=arrays,
                     )
+                    timings["existing_validation_seconds"] = time.perf_counter() - operation_started
                     write_status = "reused"
+                elif npz_path.exists() or json_path.exists():
+                    operation_started = time.perf_counter()
+                    persisted_manifest, write_status = _resolve_existing_pair(
+                        output_root,
+                        json_path,
+                        npz_path,
+                        expected_manifest=manifest,
+                        expected_arrays=arrays,
+                    )
+                    timings["existing_validation_seconds"] = time.perf_counter() - operation_started
+                    existing_pairs[episode_index] = (persisted_manifest, json_path, npz_path)
                 else:
-                    if npz_path.exists() or json_path.exists():
-                        persisted_manifest, write_status = _resolve_existing_pair(
-                            output_root,
-                            json_path,
-                            npz_path,
-                            expected_manifest=manifest,
-                            expected_arrays=arrays,
-                        )
-                        existing_pairs[episode_index] = (persisted_manifest, json_path, npz_path)
-                    else:
-                        _atomic_write_npz(npz_path, arrays)
-                        manifest["numeric_artifact"].update(
-                            {
-                                "size_bytes": npz_path.stat().st_size,
-                                "sha256": _file_sha256(npz_path),
-                            }
-                        )
-                        _atomic_write_json(json_path, manifest)
-                        persisted_manifest = manifest
-                        existing_pairs[episode_index] = (persisted_manifest, json_path, npz_path)
-                        write_status = "written"
+                    operation_started = time.perf_counter()
+                    _atomic_write_npz(npz_path, arrays)
+                    timings["npz_compress_fsync_seconds"] = time.perf_counter() - operation_started
+                    operation_started = time.perf_counter()
+                    manifest["numeric_artifact"].update(
+                        {
+                            "size_bytes": npz_path.stat().st_size,
+                            "sha256": _file_sha256(npz_path),
+                        }
+                    )
+                    timings["npz_sha256_seconds"] = time.perf_counter() - operation_started
+                    operation_started = time.perf_counter()
+                    _atomic_write_json(json_path, manifest)
+                    timings["json_write_seconds"] = time.perf_counter() - operation_started
+                    persisted_manifest = manifest
+                    existing_pairs[episode_index] = (persisted_manifest, json_path, npz_path)
+                    write_status = "written"
                 manifest_index[episode_index] = persisted_manifest
+                operation_started = time.perf_counter()
                 _atomic_write_manifest_index(output_root / "manifest.jsonl", manifest_index)
+                timings["manifest_checkpoint_seconds"] = time.perf_counter() - operation_started
             else:
                 persisted_manifest = manifest
             manifests.append(persisted_manifest)
+            for name, seconds in timings.items():
+                aggregate_timings[name] = aggregate_timings.get(name, 0.0) + seconds
             print(
                 f"[{ordinal}/{len(selected_indices)}] episode={episode_index} split={split} "
                 f"artifact={write_status} "
-                f"source={source_end - source_start} sampled={len(adapted.timestamps_s)} "
-                f"raw_state={raw_states.shape} policy_action={policy_actions.shape} "
-                f"weaver_state={adapted.states.shape} weaver_action={adapted.state_delta_actions.shape} "
-                f"max_dt_error={adapted.timing_errors_s.max(initial=0.0):.6f}s",
+                f"source={payload['source_end'] - payload['source_start']} sampled={payload['sampled_count']} "
+                f"raw_state={payload['raw_state_shape']} policy_action={payload['policy_action_shape']} "
+                f"weaver_state={payload['weaver_state_shape']} weaver_action={payload['weaver_action_shape']} "
+                f"max_dt_error={payload['max_dt_error']:.6f}s timings={json.dumps(timings, sort_keys=True)}",
                 flush=True,
             )
         except ArtifactResumeError:
@@ -1026,8 +1096,12 @@ def _main_unlocked(args: Args) -> None:
             if args.fail_fast:
                 raise
 
+    wall_seconds = time.perf_counter() - run_started
+    episode_loop_seconds = time.perf_counter() - episode_loop_started
+    processed_source_rows = sum(int(manifest["source"]["full_rate_count"]) for manifest in manifests)
     summary = {
         "schema_version": _adapter.SCHEMA_VERSION,
+        "preparation_runtime": "serial-v1",
         "dataset_repo_id": data_factory.repo_id,
         "dataset_metadata_sha256": metadata_sha256,
         "dataset_provenance": dataset_provenance,
@@ -1040,9 +1114,18 @@ def _main_unlocked(args: Args) -> None:
         "target_hz": args.target_hz,
         "selected_video_features": list(selected_features),
         "processed": len(manifests),
+        "processed_source_rows": processed_source_rows,
         "rejected": rejected,
         "split_counts": {
             split: sum(manifest["split"] == split for manifest in manifests) for split in ("train", "val", "test")
+        },
+        "timings": {
+            "wall_seconds": wall_seconds,
+            "setup_seconds": episode_loop_started - run_started,
+            "episode_loop_seconds": episode_loop_seconds,
+            "episodes_per_minute": 60.0 * len(manifests) / wall_seconds if wall_seconds else 0.0,
+            "source_rows_per_second": processed_source_rows / wall_seconds if wall_seconds else 0.0,
+            "stage_totals_seconds": aggregate_timings,
         },
         "latent_complete": False,
         "reward_export": dict(_reward_contract.REWARD_CONTRACT),

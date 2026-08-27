@@ -26,6 +26,8 @@ git pull --ff-only origin tc-b1k-weaver
 test "$(git rev-parse HEAD)" = "$(git rev-parse origin/tc-b1k-weaver)"
 test -z "$(git status --porcelain)"
 git ls-files --error-unmatch \
+  scripts/b1k/prepare_weaver_dataset_parallel.py \
+  scripts/b1k/prepare_weaver_dataset_parallel_test.py \
   scripts/b1k/export_weaver_frames.py \
   scripts/b1k/cache_weaver_latents.py \
   src/openpi/weaver/frame_cache.py
@@ -39,6 +41,10 @@ uv run pytest --confcutdir=src/openpi/weaver \
   src/openpi/weaver/latent_cache_test.py \
   src/openpi/weaver/behavior_precomputed_test.py \
   src/openpi/weaver/norm_stats_test.py -q
+
+uv run pytest -q \
+  scripts/b1k/prepare_weaver_dataset_test.py \
+  scripts/b1k/prepare_weaver_dataset_parallel_test.py
 ```
 
 Pass: all tests pass; there is no skipped shape, NaN, network access, or GPU
@@ -72,16 +78,21 @@ distinct tasks/eight episodes, every episode has strictly increasing timestamps,
 the maximum 5 Hz timing error is finite and within the adapter threshold, and no
 episode is rejected.
 
-Materialize the exact same subset:
+Materialize the exact same subset through the parallel entry point. Each worker
+opens an independent numeric-only LeRobot view; only the coordinator commits
+the final NPZ/JSON pairs and manifest index:
 
 ```bash
-uv run python scripts/b1k/prepare_weaver_dataset.py \
+uv run python scripts/b1k/prepare_weaver_dataset_parallel.py \
   --dataset-root "$B1K_DATASET_ROOT" \
   --output-dir "$NUMERIC_SMOKE" \
   --sample-tasks 4 \
   --episodes-per-task 2 \
   --selection-seed 2026 \
-  --min-sampled-frames 52
+  --min-sampled-frames 52 \
+  --workers 2 \
+  --worker-threads 1 \
+  --manifest-flush-every 2
 ```
 
 Pass:
@@ -114,21 +125,53 @@ rejects a row solely because a marker is true. Only the final sampled
 observation is invalid for supervised transition training because it has no
 later sampled observation; its source tail remains preserved for audit.
 
-For the actual full-data preparation, use the same command without subset
-selection and write to a fresh output directory:
+Before the actual full-data run, benchmark real application concurrency rather
+than CPU affinity alone. Use the same episode list for every run:
+
+```bash
+for workers in 1 2 4 8; do
+  BENCH_RUNTIME=parallel \
+  BENCH_MODE=dry-run \
+  WORKERS="$workers" \
+  THREADS=1 \
+  DATASET_ROOT="$B1K_DATASET_ROOT" \
+  scripts/b1k/benchmark_weaver_prepare.sh
+done
+```
+
+Compare `throughput_source_rows_per_second` and the stage timings in the final
+summary. Do not jump directly to 55 workers: every worker opens its own dataset
+view, so excess workers can amplify GPFS contention. A dry run excludes NPZ
+compression, hashes, fsync, JSON/index writes, frame decode, and SD3 encoding;
+it is not a full preparation benchmark.
+
+For the actual full-data preparation, use the parallel command without subset
+selection and write to a fresh output directory. Start with the best measured
+2/4/8-worker configuration:
 
 ```bash
 export NUMERIC_FULL="$WEAVER_WORK_ROOT/numeric-full-v6"
 test ! -e "$NUMERIC_FULL"
 
-uv run python scripts/b1k/prepare_weaver_dataset.py \
+uv run python scripts/b1k/prepare_weaver_dataset_parallel.py \
   --dataset-root "$B1K_DATASET_ROOT" \
   --output-dir "$NUMERIC_FULL" \
   --held-out-task-fraction 0.1 \
   --selection-seed 2026 \
   --split-seed 42 \
-  --min-sampled-frames 10
+  --min-sampled-frames 10 \
+  --workers 4 \
+  --worker-threads 1 \
+  --manifest-flush-every 256
 ```
+
+The per-episode NPZ/JSON pair is the durable source of truth. The coordinator
+checkpoints the rebuildable `manifest.jsonl` every 256 successful episodes and
+again during orderly shutdown, avoiding 20,000 full index rewrites and fsyncs.
+After an abrupt interruption, the next run scans and byte-validates every
+complete pair before rebuilding the index; a JSON-only/NPZ-only, stale, or
+corrupt pair still fails closed. `summary.json` and `task_prompts.json` appear
+only after a normal complete run and remain mandatory downstream gates.
 
 The default deterministic task-level holdout is 10 of the 100 official task
 names; an explicit `--held-out-tasks` list takes precedence. The writer records

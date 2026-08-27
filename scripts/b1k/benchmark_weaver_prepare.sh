@@ -20,8 +20,11 @@ Environment overrides:
   DATASET_ROOT             B1K dataset root
   WEAVER_WORK_ROOT         work root (default: /tmp/weaver-benchmark)
   BENCH_MODE               dry-run or write (default: dry-run)
+  BENCH_RUNTIME            serial or parallel (default: serial)
   BENCH_EPISODES           space-separated episode indices (default: 780..787)
   BENCH_OUT                explicit new, isolated output directory
+  WORKERS                  parallel worker count (default: 4)
+  MAX_IN_FLIGHT            optional parallel in-flight bound (default: 2*workers)
   CPUSET                   optional taskset CPU list, e.g. 0-7
   NICE_LEVEL               optional nice level, e.g. 10
   THREADS                  optional BLAS/OpenMP thread limit, e.g. 1 or 8
@@ -36,6 +39,9 @@ Examples:
 
   BENCH_MODE=write DATASET_ROOT=/path/to/v3again CPUSET=0-15 \
     scripts/b1k/benchmark_weaver_prepare.sh
+
+  BENCH_RUNTIME=parallel WORKERS=4 THREADS=1 \
+    DATASET_ROOT=/path/to/v3again scripts/b1k/benchmark_weaver_prepare.sh
 EOF
 }
 
@@ -48,11 +54,12 @@ OPENPI_ROOT="${OPENPI_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}
 DATASET_ROOT="${DATASET_ROOT:-/inspire/dataset/behavior-1k-2026-challenge-demos/v3again}"
 WEAVER_WORK_ROOT="${WEAVER_WORK_ROOT:-/tmp/weaver-benchmark}"
 BENCH_MODE="${BENCH_MODE:-dry-run}"
+BENCH_RUNTIME="${BENCH_RUNTIME:-serial}"
 BENCH_EPISODES="${BENCH_EPISODES:-780 781 782 783 784 785 786 787}"
+WORKERS="${WORKERS:-4}"
 SAMPLE_SECONDS="${SAMPLE_SECONDS:-5}"
 PROCESS_LIST_PATH="${TMPDIR:-/tmp}/weaver_bench_prepare_ps.$$"
 pipeline_pid=""
-child_pid=""
 telemetry_pid=""
 
 cleanup() {
@@ -62,11 +69,11 @@ cleanup() {
     kill "$telemetry_pid" 2>/dev/null || true
     wait "$telemetry_pid" 2>/dev/null || true
   fi
-  if [[ -n "$child_pid" ]]; then
-    kill "$child_pid" 2>/dev/null || true
-  fi
   if [[ -n "$pipeline_pid" ]]; then
-    kill "$pipeline_pid" 2>/dev/null || true
+    read -r -a cleanup_pids <<< "$(collect_process_tree "$pipeline_pid")"
+    for ((index=${#cleanup_pids[@]} - 1; index >= 0; index--)); do
+      kill "${cleanup_pids[index]}" 2>/dev/null || true
+    done
     wait "$pipeline_pid" 2>/dev/null || true
   fi
   rm -f "$PROCESS_LIST_PATH" 2>/dev/null || true
@@ -76,10 +83,41 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+collect_process_tree() {
+  local frontier="$1"
+  local all="$1"
+  local next pid children
+  while [[ -n "$frontier" ]]; do
+    next=""
+    for pid in $frontier; do
+      children="$(pgrep -P "$pid" 2>/dev/null || true)"
+      if [[ -n "$children" ]]; then
+        all="$all $children"
+        next="$next $children"
+      fi
+    done
+    frontier="$next"
+  done
+  printf '%s\n' "$all"
+}
+
 case "$BENCH_MODE" in
   dry-run|write) ;;
   *) echo "BENCH_MODE must be dry-run or write, got: $BENCH_MODE" >&2; exit 2 ;;
 esac
+case "$BENCH_RUNTIME" in
+  serial|parallel) ;;
+  *) echo "BENCH_RUNTIME must be serial or parallel, got: $BENCH_RUNTIME" >&2; exit 2 ;;
+esac
+
+if ! [[ "$WORKERS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "WORKERS must be a positive integer" >&2
+  exit 2
+fi
+if [[ -n "${MAX_IN_FLIGHT:-}" ]] && ! [[ "$MAX_IN_FLIGHT" =~ ^[1-9][0-9]*$ ]]; then
+  echo "MAX_IN_FLIGHT must be a positive integer" >&2
+  exit 2
+fi
 
 if ! [[ "$SAMPLE_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
   echo "SAMPLE_SECONDS must be a positive integer" >&2
@@ -95,7 +133,7 @@ if [[ ! -d "$DATASET_ROOT" ]]; then
   exit 2
 fi
 
-if pgrep -af 'prepare_weaver_dataset\.py' >"$PROCESS_LIST_PATH" 2>/dev/null; then
+if pgrep -af 'prepare_weaver_dataset(_parallel)?\.py' >"$PROCESS_LIST_PATH" 2>/dev/null; then
   if [[ "${ALLOW_PRODUCTION_CONTENTION:-0}" != "1" ]]; then
     echo "A prepare_weaver_dataset.py process is already running:" >&2
     cat "$PROCESS_LIST_PATH" >&2
@@ -131,8 +169,13 @@ if (( ${#EPISODES[@]} == 0 )); then
   exit 2
 fi
 
+prepare_script="scripts/b1k/prepare_weaver_dataset.py"
+if [[ "$BENCH_RUNTIME" == "parallel" ]]; then
+  prepare_script="scripts/b1k/prepare_weaver_dataset_parallel.py"
+fi
+
 cmd=(
-  uv run python scripts/b1k/prepare_weaver_dataset.py
+  uv run python "$prepare_script"
   --config-name pi05_b1k_full
   --dataset-root "$DATASET_ROOT"
   --output-dir "$BENCH_OUT"
@@ -144,6 +187,12 @@ cmd=(
   --held-out-task-fraction 0.1
   --fail-fast
 )
+if [[ "$BENCH_RUNTIME" == "parallel" ]]; then
+  cmd+=(--workers "$WORKERS" --worker-threads "${THREADS:-1}")
+  if [[ -n "${MAX_IN_FLIGHT:-}" ]]; then
+    cmd+=(--max-in-flight "$MAX_IN_FLIGHT")
+  fi
+fi
 if [[ "$BENCH_MODE" == "dry-run" ]]; then
   cmd+=(--dry-run)
 fi
@@ -183,6 +232,7 @@ fi
   echo "started_at=$(date --iso-8601=seconds)"
   echo "host=$(hostname)"
   echo "mode=$BENCH_MODE"
+  echo "runtime=$BENCH_RUNTIME"
   echo "openpi_root=$OPENPI_ROOT"
   echo "git_revision=$(git -C "$OPENPI_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
   echo "dataset_root=$DATASET_ROOT"
@@ -190,6 +240,10 @@ fi
   echo "episodes=${EPISODES[*]}"
   echo "cpuset=${CPUSET:-unrestricted}"
   echo "threads=${THREADS:-inherited}"
+  if [[ "$BENCH_RUNTIME" == "parallel" ]]; then
+    echo "workers=$WORKERS"
+    echo "max_in_flight=${MAX_IN_FLIGHT:-default}"
+  fi
   echo "nice_level=${NICE_LEVEL:-inherited}"
   echo "nproc=$(nproc 2>/dev/null || echo unavailable)"
   awk '/^Cpus_allowed_list:|^Mems_allowed_list:/{print}' /proc/self/status 2>/dev/null || true
@@ -212,19 +266,17 @@ pipeline_pid=$!
   echo "===== telemetry ====="
   while kill -0 "$pipeline_pid" 2>/dev/null; do
     now="$(date --iso-8601=seconds)"
-    candidate="$pipeline_pid"
-    while descendant="$(pgrep -P "$candidate" -n 2>/dev/null || true)" && [[ -n "$descendant" ]]; do
-      candidate="$descendant"
-    done
-    if [[ "$candidate" != "$pipeline_pid" ]]; then
-      child_pid="$candidate"
-    fi
-    if [[ -n "$child_pid" && -r "/proc/$child_pid/status" ]]; then
-      ps -o pid,ppid,etime,%cpu,%mem,rss,vsz,threads,stat,cmd -p "$child_pid" || true
-      awk '/^VmRSS:|^VmSize:|^Threads:/{print}' "/proc/$child_pid/status" || true
-      if [[ -r "/proc/$child_pid/io" ]]; then
-        awk -v now="$now" '/^read_bytes:|^write_bytes:|^syscr:|^syscw:/{printf "%s %s %s\n", now, $1, $2}' "/proc/$child_pid/io"
-      fi
+    read -r -a tree_pids <<< "$(collect_process_tree "$pipeline_pid")"
+    if (( ${#tree_pids[@]} > 0 )); then
+      pid_csv="$(IFS=,; echo "${tree_pids[*]}")"
+      ps -o pid,ppid,etime,%cpu,%mem,rss,vsz,threads,stat,cmd -p "$pid_csv" || true
+      for observed_pid in "${tree_pids[@]}"; do
+        if [[ -r "/proc/$observed_pid/io" ]]; then
+          awk -v now="$now" -v pid="$observed_pid" \
+            '/^read_bytes:|^write_bytes:|^syscr:|^syscw:/{printf "%s pid=%s %s %s\n", now, pid, $1, $2}' \
+            "/proc/$observed_pid/io"
+        fi
+      done
     else
       ps -o pid,ppid,etime,%cpu,%mem,rss,vsz,threads,stat,cmd -p "$pipeline_pid" || true
     fi
@@ -247,15 +299,29 @@ kill "$telemetry_pid" 2>/dev/null || true
 wait "$telemetry_pid" 2>/dev/null || true
 telemetry_pid=""
 pipeline_pid=""
-child_pid=""
 
 end_epoch="$(date +%s)"
 elapsed=$((end_epoch - start_epoch))
 completed="$(grep -cE '^\[[0-9]+/[0-9]+\]' "$LOG_PATH" 2>/dev/null || true)"
+completed_source_rows="$(
+  awk '
+    /^\[[0-9]+\/[0-9]+\]/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^source=[0-9]+$/) {
+          split($i, pair, "=")
+          rows += pair[2]
+        }
+      }
+    }
+    END { print rows + 0 }
+  ' "$LOG_PATH"
+)"
 echo "status=$status elapsed_seconds=$elapsed completed_episodes=$completed log=$LOG_PATH telemetry=$TELEMETRY_PATH"
 if (( elapsed > 0 )) && [[ "$completed" =~ ^[0-9]+$ ]]; then
   awk -v episodes="$completed" -v seconds="$elapsed" \
     'BEGIN { printf "throughput_episodes_per_minute=%.3f\n", episodes * 60.0 / seconds }'
+  awk -v rows="$completed_source_rows" -v seconds="$elapsed" \
+    'BEGIN { printf "throughput_source_rows_per_second=%.3f\n", rows / seconds }'
 fi
 if [[ "$BENCH_MODE" == "write" && -d "$BENCH_OUT" ]]; then
   printf 'final_counts '
