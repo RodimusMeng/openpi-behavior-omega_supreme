@@ -158,6 +158,7 @@ class Args:
     expected_metadata_sha256: str | None = None
     dry_run: bool = False
     fail_fast: bool = True
+    manifest_flush_every: int = 256
 
 
 def _scalar(value: Any) -> Any:
@@ -497,6 +498,16 @@ def _load_npz_arrays(path: Path) -> dict[str, np.ndarray]:
         raise ArtifactResumeError(f"Existing numeric artifact is corrupt or unsafe: {path}: {exc}") from exc
 
 
+def _npz_array_keys(path: Path) -> set[str]:
+    """Read the NPZ directory without inflating every compressed array."""
+
+    try:
+        with np.load(path, allow_pickle=False) as archive:
+            return set(archive.files)
+    except (OSError, ValueError, KeyError) as exc:
+        raise ArtifactResumeError(f"Existing numeric artifact is corrupt or unsafe: {path}: {exc}") from exc
+
+
 def _validate_existing_pair(
     output_root: Path,
     json_path: Path,
@@ -530,12 +541,13 @@ def _validate_existing_pair(
     if artifact.get("size_bytes") != npz_path.stat().st_size or artifact.get("sha256") != _file_sha256(npz_path):
         raise ArtifactResumeError(f"Existing numeric artifact bytes do not match its manifest: {npz_path}")
 
-    arrays = _load_npz_arrays(npz_path)
+    arrays = _load_npz_arrays(npz_path) if expected_arrays is not None else None
+    array_keys = set(arrays) if arrays is not None else _npz_array_keys(npz_path)
     declared_keys = artifact.get("keys")
-    if set(arrays) != NUMERIC_ARRAY_KEYS or set(declared_keys or ()) != NUMERIC_ARRAY_KEYS:
+    if array_keys != NUMERIC_ARRAY_KEYS or set(declared_keys or ()) != NUMERIC_ARRAY_KEYS:
         raise ArtifactResumeError(
             f"Existing numeric artifact keys are stale: expected {sorted(NUMERIC_ARRAY_KEYS)}, "
-            f"manifest={sorted(declared_keys or ())}, npz={sorted(arrays)}"
+            f"manifest={sorted(declared_keys or ())}, npz={sorted(array_keys)}"
         )
     if expected_manifest is not None:
         if manifest.get("semantic_sha256") != expected_manifest.get("semantic_sha256"):
@@ -547,12 +559,24 @@ def _validate_existing_pair(
         if artifact.get("path") != expected_artifact.get("path"):
             raise ArtifactResumeError(f"Existing numeric artifact path is stale: {json_path}")
     if expected_arrays is not None:
+        assert arrays is not None
         if set(expected_arrays) != NUMERIC_ARRAY_KEYS:
             raise AssertionError("Internal numeric array contract is incomplete")
         for key in sorted(NUMERIC_ARRAY_KEYS):
             if not np.array_equal(arrays[key], expected_arrays[key]):
                 raise ArtifactResumeError(f"Existing numeric array {key!r} is stale: {npz_path}")
     return manifest
+
+
+def _partition_selected_for_resume(
+    selected_indices: list[int],
+    existing_pairs: dict[int, tuple[dict[str, Any], Path, Path]],
+) -> tuple[list[int], list[dict[str, Any]]]:
+    """Return missing work and already byte-validated selected manifests."""
+
+    pending = [index for index in selected_indices if index not in existing_pairs]
+    reused = [existing_pairs[index][0] for index in selected_indices if index in existing_pairs]
+    return pending, reused
 
 
 def _discover_existing_pairs(output_root: Path) -> dict[int, tuple[dict[str, Any], Path, Path]]:
@@ -668,12 +692,20 @@ def _authoritative_index_column(value: Any, *, name: str, expected: np.ndarray) 
     return array
 
 
+def _numeric_dataset_view(dataset: Any, columns: tuple[str, ...]) -> Any:
+    """Select numeric columns once and bypass LeRobot's Arrow-to-Torch transform."""
+
+    selected = dataset.hf_dataset.select_columns(list(columns))
+    return selected.with_format("numpy")
+
+
 def _episode_rows(dataset: Any, episode: dict[str, Any], columns: tuple[str, ...]) -> tuple[dict[str, Any], int, int]:
     start = int(_scalar(episode["dataset_from_index"]))
     end = int(_scalar(episode["dataset_to_index"]))
     if end <= start:
         raise ValueError(f"Episode {episode.get('episode_index')} has invalid row bounds [{start}, {end})")
-    rows = dataset.hf_dataset.select_columns(list(columns))[start:end]
+    hf_dataset = dataset.hf_dataset if hasattr(dataset, "hf_dataset") else dataset
+    rows = hf_dataset[start:end]
     return rows, start, end
 
 
@@ -842,6 +874,8 @@ def _prepare_dataset(args: Args):
 
 def _main_unlocked(args: Args) -> None:
     run_started = time.perf_counter()
+    if args.manifest_flush_every <= 0:
+        raise ValueError(f"manifest_flush_every must be positive, got {args.manifest_flush_every}")
     config, data_factory, dataset, dataset_root = _prepare_dataset(args)
     contract = build_r1pro_contract()
     selected_features = _adapter.validate_selected_video_features(
@@ -949,6 +983,7 @@ def _main_unlocked(args: Args) -> None:
         "next.terminated",
         "next.truncated",
     )
+    numeric_dataset = _numeric_dataset_view(dataset, columns)
 
     print(
         json.dumps(
@@ -989,15 +1024,28 @@ def _main_unlocked(args: Args) -> None:
             dataset_provenance=dataset_provenance,
         )
     manifest_index = {episode_index: pair[0] for episode_index, pair in existing_pairs.items()}
-    manifests: list[dict[str, Any]] = []
+    selected_count = len(selected_indices)
+    selected_indices, manifests = _partition_selected_for_resume(selected_indices, existing_pairs)
+    reused_existing_count = len(manifests)
+    print(
+        json.dumps(
+            {
+                "resume_reused_episodes": reused_existing_count,
+                "episodes_to_prepare": len(selected_indices),
+                "manifest_flush_every": args.manifest_flush_every,
+            }
+        ),
+        flush=True,
+    )
     rejected: list[dict[str, Any]] = []
     aggregate_timings: dict[str, float] = {}
+    dirty_since_flush = 0
     episode_loop_started = time.perf_counter()
     for ordinal, episode_index in enumerate(selected_indices, start=1):
         episode_row = all_episode_rows[episode_index]
         try:
             payload = _prepare_episode_payload(
-                dataset=dataset,
+                dataset=numeric_dataset,
                 episode_index=episode_index,
                 prompt=episode_prompts[episode_index],
                 episode_row=episode_row,
@@ -1065,9 +1113,12 @@ def _main_unlocked(args: Args) -> None:
                     existing_pairs[episode_index] = (persisted_manifest, json_path, npz_path)
                     write_status = "written"
                 manifest_index[episode_index] = persisted_manifest
-                operation_started = time.perf_counter()
-                _atomic_write_manifest_index(output_root / "manifest.jsonl", manifest_index)
-                timings["manifest_checkpoint_seconds"] = time.perf_counter() - operation_started
+                dirty_since_flush += 1
+                if dirty_since_flush >= args.manifest_flush_every:
+                    operation_started = time.perf_counter()
+                    _atomic_write_manifest_index(output_root / "manifest.jsonl", manifest_index)
+                    timings["manifest_checkpoint_seconds"] = time.perf_counter() - operation_started
+                    dirty_since_flush = 0
             else:
                 persisted_manifest = manifest
             manifests.append(persisted_manifest)
@@ -1094,6 +1145,8 @@ def _main_unlocked(args: Args) -> None:
     wall_seconds = time.perf_counter() - run_started
     episode_loop_seconds = time.perf_counter() - episode_loop_started
     processed_source_rows = sum(int(manifest["source"]["full_rate_count"]) for manifest in manifests)
+    newly_prepared = manifests[reused_existing_count:]
+    newly_processed_source_rows = sum(int(manifest["source"]["full_rate_count"]) for manifest in newly_prepared)
     summary = {
         "schema_version": _adapter.SCHEMA_VERSION,
         "preparation_runtime": "serial-v1",
@@ -1110,6 +1163,12 @@ def _main_unlocked(args: Args) -> None:
         "selected_video_features": list(selected_features),
         "processed": len(manifests),
         "processed_source_rows": processed_source_rows,
+        "resume": {
+            "selected": selected_count,
+            "reused_existing": reused_existing_count,
+            "newly_prepared": len(newly_prepared),
+            "remaining_after_run": selected_count - len(manifests),
+        },
         "rejected": rejected,
         "split_counts": {
             split: sum(manifest["split"] == split for manifest in manifests) for split in ("train", "val", "test")
@@ -1118,8 +1177,8 @@ def _main_unlocked(args: Args) -> None:
             "wall_seconds": wall_seconds,
             "setup_seconds": episode_loop_started - run_started,
             "episode_loop_seconds": episode_loop_seconds,
-            "episodes_per_minute": 60.0 * len(manifests) / wall_seconds if wall_seconds else 0.0,
-            "source_rows_per_second": processed_source_rows / wall_seconds if wall_seconds else 0.0,
+            "episodes_per_minute": 60.0 * len(newly_prepared) / wall_seconds if wall_seconds else 0.0,
+            "source_rows_per_second": newly_processed_source_rows / wall_seconds if wall_seconds else 0.0,
             "stage_totals_seconds": aggregate_timings,
         },
         "latent_complete": False,

@@ -263,6 +263,56 @@ def test_complete_pair_is_strictly_reused_and_stale_values_fail(tmp_path):
         )
 
 
+def test_discovery_checks_keys_without_inflating_existing_arrays(tmp_path, monkeypatch):
+    manifest, _, _, _ = _artifact(tmp_path, episode_index=7)
+
+    def fail_if_inflated(_path):
+        raise AssertionError("resume discovery must not inflate every compressed array")
+
+    monkeypatch.setattr(prepare, "_load_npz_arrays", fail_if_inflated)
+    discovered = prepare._discover_existing_pairs(tmp_path)
+
+    assert discovered[7][0] == manifest
+
+
+def test_resume_partition_reuses_validated_pairs_and_schedules_only_missing(tmp_path):
+    first, _, first_json, first_npz = _artifact(tmp_path, episode_index=1)
+    third, _, third_json, third_npz = _artifact(tmp_path, episode_index=3)
+    existing = {
+        1: (first, first_json, first_npz),
+        3: (third, third_json, third_npz),
+    }
+
+    pending, reused = prepare._partition_selected_for_resume([1, 2, 3, 4], existing)
+
+    assert pending == [2, 4]
+    assert [manifest["episode_index"] for manifest in reused] == [1, 3]
+
+
+def test_numeric_dataset_view_selects_once_and_uses_numpy_format():
+    calls = []
+    numeric_view = object()
+
+    class SelectedView:
+        def with_format(self, format_name):
+            calls.append(("with_format", format_name))
+            return numeric_view
+
+    class HFDataset:
+        def select_columns(self, columns):
+            calls.append(("select_columns", tuple(columns)))
+            return SelectedView()
+
+    dataset = type("Dataset", (), {"hf_dataset": HFDataset()})()
+    result = prepare._numeric_dataset_view(dataset, ("timestamp", "observation.state"))
+
+    assert result is numeric_view
+    assert calls == [
+        ("select_columns", ("timestamp", "observation.state")),
+        ("with_format", "numpy"),
+    ]
+
+
 def test_complete_pair_that_appears_after_initial_scan_is_strictly_reused(tmp_path):
     manifest, arrays, json_path, npz_path = _artifact(tmp_path, episode_index=199)
 

@@ -173,6 +173,14 @@ complete pair before rebuilding the index; a JSON-only/NPZ-only, stale, or
 corrupt pair still fails closed. `summary.json` and `task_prompts.json` appear
 only after a normal complete run and remain mandatory downstream gates.
 
+Validated pairs selected by a resumed run are not regenerated from Arrow or
+recompressed. Only missing episode indices enter the serial loop or process
+pool. The numeric HuggingFace view is also constructed once per process with
+the NumPy formatter, bypassing LeRobot's frame-oriented Arrow-to-Torch transform
+and the immediately following Torch-to-NumPy conversion. The startup scan still
+hashes every existing NPZ and checks its archive directory, JSON schema, dataset
+context, split, prompt, source bounds, and semantic provenance before reuse.
+
 The default deterministic task-level holdout is 10 of the 100 official task
 names; an explicit `--held-out-tasks` list takes precedence. The writer records
 the official `meta/tasks.jsonl` prompt catalog and hashes `info.json`,

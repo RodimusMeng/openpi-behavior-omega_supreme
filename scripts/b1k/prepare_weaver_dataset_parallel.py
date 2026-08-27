@@ -97,11 +97,12 @@ def _worker_initializer(
             f"worker={dataset.fps!r}, coordinator={shared_state['source_fps']!r}"
         )
     columns = tuple(shared_state["columns"])
+    numeric_dataset = _serial._numeric_dataset_view(dataset, columns)
     _WORKER_STATE = dict(shared_state)
     _WORKER_STATE.update(
         {
             "args": args,
-            "dataset": dataset,
+            "dataset": numeric_dataset,
             "columns": columns,
             "contract": build_r1pro_contract(),
             "worker_initialization_seconds": time.perf_counter() - started,
@@ -126,7 +127,7 @@ def _prepare_episode(episode_index: int) -> EpisodeResult:
         dataset_repo_id=str(state["dataset_repo_id"]),
         dataset_metadata_sha256=state["metadata_sha256"],
         dataset_provenance=state["dataset_provenance"],
-        source_fps=float(state["dataset"].fps),
+        source_fps=float(state["source_fps"]),
         target_hz=args.target_hz,
         min_sampled_frames=args.min_sampled_frames,
         contract=state["contract"],
@@ -388,7 +389,13 @@ def _main_unlocked(args: Args) -> None:
             dataset_provenance=state["dataset_provenance"],
         )
     manifest_index = {index: pair[0] for index, pair in existing_pairs.items()}
-    manifests: list[dict[str, Any]] = []
+    selected_count = len(selected_indices)
+    selected_indices, manifests = _serial._partition_selected_for_resume(selected_indices, existing_pairs)
+    reused_existing_count = len(manifests)
+    print(json.dumps({
+        "resume_reused_episodes": reused_existing_count,
+        "episodes_to_prepare": len(selected_indices),
+    }), flush=True)
     rejected: list[dict[str, Any]] = []
     aggregate_timings: dict[str, float] = {}
     dirty_since_flush = 0
@@ -475,6 +482,8 @@ def _main_unlocked(args: Args) -> None:
     wall_seconds = time.perf_counter() - run_started
     processing_seconds = time.perf_counter() - processing_started
     processed_source_rows = sum(int(manifest["source"]["full_rate_count"]) for manifest in manifests)
+    newly_prepared = manifests[reused_existing_count:]
+    newly_processed_source_rows = sum(int(manifest["source"]["full_rate_count"]) for manifest in newly_prepared)
     summary = {
         "schema_version": _adapter.SCHEMA_VERSION, "preparation_runtime": "parallel-single-writer-v1",
         "dataset_repo_id": state["dataset_repo_id"], "dataset_metadata_sha256": state["metadata_sha256"],
@@ -487,6 +496,12 @@ def _main_unlocked(args: Args) -> None:
         "held_out_tasks": list(metadata["held_out_tasks"]), "target_hz": args.target_hz,
         "selected_video_features": list(metadata["selected_features"]), "processed": len(manifests),
         "processed_source_rows": processed_source_rows,
+        "resume": {
+            "selected": selected_count,
+            "reused_existing": reused_existing_count,
+            "newly_prepared": len(newly_prepared),
+            "remaining_after_run": selected_count - len(manifests),
+        },
         "rejected": rejected,
         "split_counts": {
             split: sum(manifest["split"] == split for manifest in manifests) for split in ("train", "val", "test")
@@ -499,8 +514,8 @@ def _main_unlocked(args: Args) -> None:
             "wall_seconds": wall_seconds,
             "setup_seconds": processing_started - run_started,
             "processing_seconds": processing_seconds,
-            "episodes_per_minute": 60.0 * len(manifests) / wall_seconds if wall_seconds else 0.0,
-            "source_rows_per_second": processed_source_rows / wall_seconds if wall_seconds else 0.0,
+            "episodes_per_minute": 60.0 * len(newly_prepared) / wall_seconds if wall_seconds else 0.0,
+            "source_rows_per_second": newly_processed_source_rows / wall_seconds if wall_seconds else 0.0,
             "stage_totals_seconds": aggregate_timings,
         },
         "latent_complete": False, "reward_export": dict(_reward_contract.REWARD_CONTRACT),

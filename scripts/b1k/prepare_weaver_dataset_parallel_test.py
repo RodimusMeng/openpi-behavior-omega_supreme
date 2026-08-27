@@ -88,7 +88,10 @@ def test_worker_initializer_reopens_and_checks_its_numeric_dataset(tmp_path, mon
     args = parallel.Args(workers=1)
     state = _coordinator_state(tmp_path / "dataset")
     shared = parallel._worker_shared_state(state, staging_root=tmp_path / "staging")
-    dataset = types.SimpleNamespace(fps=30.0)
+    numeric_view = object()
+    selected_view = types.SimpleNamespace(with_format=lambda _format: numeric_view)
+    hf_dataset = types.SimpleNamespace(select_columns=lambda _columns: selected_view)
+    dataset = types.SimpleNamespace(fps=30.0, hf_dataset=hf_dataset)
     data_factory = types.SimpleNamespace(repo_id="b1k-v3again")
     monkeypatch.setattr(
         parallel._serial,
@@ -99,7 +102,7 @@ def test_worker_initializer_reopens_and_checks_its_numeric_dataset(tmp_path, mon
 
     parallel._worker_initializer(*parallel._worker_initializer_args(args, state, shared))
 
-    assert parallel._WORKER_STATE["dataset"] is dataset
+    assert parallel._WORKER_STATE["dataset"] is numeric_view
     assert parallel._WORKER_STATE["source_fps"] == 30.0
     assert parallel._WORKER_STATE["report_worker_initialization"] is True
     parallel._WORKER_STATE = None
