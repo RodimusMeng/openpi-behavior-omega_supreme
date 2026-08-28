@@ -49,24 +49,24 @@ def _parse_args(argv: list[str] | None = None) -> Args:
     return Args(**vars(values))
 
 
-def _resolved_commit(value: Any) -> str | None:
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
+def _resolved_model_path(value: Any) -> Path | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return Path(value).expanduser().resolve()
 
 
-def _assert_loaded_revision(task_encoder: Any, expected: str) -> None:
-    """Prove that both model and tokenizer resolve to the requested HF commit."""
+def _assert_loaded_snapshot(task_encoder: Any, expected: Path) -> None:
+    """Prove that both upstream CLIP components loaded the hashed local snapshot."""
 
     text_encoder = getattr(task_encoder, "text_encoder", None)
     tokenizer = getattr(task_encoder, "tokenizer", None)
-    model_revision = _resolved_commit(getattr(getattr(text_encoder, "config", None), "_commit_hash", None))
-    tokenizer_revision = _resolved_commit(getattr(tokenizer, "init_kwargs", {}).get("_commit_hash"))
-    observed = {value for value in (model_revision, tokenizer_revision) if value is not None}
-    if observed != {expected}:
+    model_path = _resolved_model_path(getattr(getattr(text_encoder, "config", None), "_name_or_path", None))
+    tokenizer_path = _resolved_model_path(getattr(tokenizer, "name_or_path", None))
+    expected = expected.resolve()
+    if model_path != expected or tokenizer_path != expected:
         raise ValueError(
-            "Released task encoder did not resolve model and tokenizer to the requested revision: "
-            f"expected={expected!r}, model={model_revision!r}, tokenizer={tokenizer_revision!r}"
+            "Released task encoder did not load model and tokenizer from the pinned local snapshot: "
+            f"expected={str(expected)!r}, model={str(model_path)!r}, tokenizer={str(tokenizer_path)!r}"
         )
 
 
@@ -148,13 +148,13 @@ def main(args: Args) -> None:
         raise task_cache.TaskCacheMissError(f"Task-feature cache is missing: {output_root}")
 
     try:
-        from weaver.wm.encoders import get_task_encoder  # noqa: PLC0415
+        from weaver.wm.encoders import ClipEncoder  # noqa: PLC0415
     except ImportError as exc:
         raise RuntimeError(
             "Official WEAVER is not importable; run in its pinned Python environment with both checkouts on PYTHONPATH"
         ) from exc
-    task_encoder = get_task_encoder(config={}, device=args.device).to(args.device).eval()
-    _assert_loaded_revision(task_encoder, args.encoder_revision)
+    task_encoder = ClipEncoder(model_name=str(snapshot), device=args.device).to(args.device).eval()
+    _assert_loaded_snapshot(task_encoder, snapshot)
     feature_dim = int(task_encoder.feature_dim)
     if feature_dim != 768:
         raise ValueError(f"Released WEAVER task feature_dim must be 768, got {feature_dim}")

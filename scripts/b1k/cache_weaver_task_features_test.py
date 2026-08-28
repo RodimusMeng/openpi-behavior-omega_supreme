@@ -28,18 +28,20 @@ def _load_script():
 cache_tasks = _load_script()
 
 
-def _fake_encoder(revision: str):
+def _fake_encoder(snapshot: Path):
     return SimpleNamespace(
-        text_encoder=SimpleNamespace(config=SimpleNamespace(_commit_hash=revision)),
-        tokenizer=SimpleNamespace(init_kwargs={"_commit_hash": revision}),
+        text_encoder=SimpleNamespace(config=SimpleNamespace(_name_or_path=str(snapshot))),
+        tokenizer=SimpleNamespace(name_or_path=str(snapshot)),
     )
 
 
-def test_loaded_task_model_and_tokenizer_must_share_requested_revision():
-    cache_tasks._assert_loaded_revision(_fake_encoder("a" * 40), "a" * 40)
+def test_loaded_task_model_and_tokenizer_must_share_pinned_snapshot(tmp_path: Path):
+    snapshot = tmp_path / "snapshot"
+    other = tmp_path / "other"
+    cache_tasks._assert_loaded_snapshot(_fake_encoder(snapshot), snapshot)
 
-    with pytest.raises(ValueError, match="did not resolve"):
-        cache_tasks._assert_loaded_revision(_fake_encoder("b" * 40), "a" * 40)
+    with pytest.raises(ValueError, match="did not load"):
+        cache_tasks._assert_loaded_snapshot(_fake_encoder(other), snapshot)
 
 
 class _FakeEncoded:

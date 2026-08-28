@@ -469,8 +469,9 @@ CUDA_VISIBLE_DEVICES=0 uv run --no-sync python \
   --device cuda
 ```
 
-The producer calls the frozen upstream `get_task_encoder()` and verifies that
-its text model and tokenizer resolved to the requested Hugging Face commit. It
+The producer constructs the frozen upstream `ClipEncoder` through its existing
+`model_name` interface, passing the materialized pinned snapshot, and verifies
+that both its text model and tokenizer loaded that exact local path. It
 writes `task_features/features.npz` plus `task_features/manifest.json`. The
 manifest binds every exact task name and prompt, the dataset/task-catalog
 hashes, released encoder contract, pinned snapshot bytes, upstream/adapter Git
