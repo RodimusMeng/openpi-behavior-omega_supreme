@@ -785,6 +785,14 @@ _CONFIGS = [
         ),
     ),
     
+    # Broad BEHAVIOR-1K absolute-action baseline.
+    # Keep this intentionally simple: full multitask data, raw controller
+    # actions, low-LR full fine-tuning. More elaborate sampling belongs in
+    # later ablations, not in the baseline.
+    # Broad BEHAVIOR-1K absolute-action baseline.
+    # Keep this intentionally simple: full multitask data, raw controller
+    # actions, low-LR full fine-tuning. More elaborate sampling belongs in
+    # later ablations, not in the baseline.
     TrainConfig(
         name="pi05_b1k_full_abs",
         model=pi0_config.Pi0Config(
@@ -811,9 +819,29 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_base/params"
         ),
-        save_interval=1_000,
-        keep_period=2_000,
-        num_train_steps=500_000,
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-6,
+            decay_steps=120_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(
+            b1=0.9,
+            b2=0.95,
+            eps=1e-8,
+            weight_decay=1e-10,
+            clip_gradient_norm=1.0,
+        ),
+        ema_decay=0.99,
+        seed=42,
+        num_workers=32,
+        prefetch_factor=2,
+        persistent_workers=True,
+        fsdp_devices=4,
+        num_train_steps=120_000,
+        save_interval=10_000,
+        keep_period=10_000,
         assets_base_dir="./outputs/assets",
         checkpoint_base_dir=(
             "/inspire/hdd/project/robot-reasoning/"
@@ -821,7 +849,6 @@ _CONFIGS = [
             "2026_behavior_challenge/tiancheng/checkpoints"
         ),
     ),
-    
     TrainConfig(
         name="pi05_b1k_radio_abs", # absolute and no depth
         model=pi0_config.Pi0Config(
