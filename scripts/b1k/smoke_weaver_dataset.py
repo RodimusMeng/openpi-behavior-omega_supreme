@@ -16,9 +16,11 @@ from openpi.weaver.behavior_precomputed import BehaviorPrecomputed
 @dataclasses.dataclass(frozen=True)
 class Args:
     dataset_dir: str
+    latent_dir: str | None = None
     task_feature_dir: str | None = None
     split: str = "train"
     position: int = 0
+    episode_index: int | None = None
     horizon: int = 8
     n_history: int = 2
     n_memory_frames: int = 0
@@ -53,16 +55,29 @@ def main(args: Args) -> None:
         normalize=args.normalize,
         reward_mode=args.reward_mode,
         collapse_prob=0.0,
+        latent_root=args.latent_dir,
         task_feature_root=args.task_feature_dir,
     )
-    if not 0 <= args.position < len(dataset):
-        raise ValueError(f"position must be in [0,{len(dataset) - 1}], got {args.position}")
-    manifest = dataset.manifests[args.position]
+    position = args.position
+    if args.episode_index is not None:
+        matches = [
+            index
+            for index, manifest in enumerate(dataset.manifests)
+            if int(manifest["episode_index"]) == args.episode_index
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"episode_index {args.episode_index} has {len(matches)} matches in split {args.split}; expected one"
+            )
+        position = matches[0]
+    if not 0 <= position < len(dataset):
+        raise ValueError(f"position must be in [0,{len(dataset) - 1}], got {position}")
+    manifest = dataset.manifests[position]
     min_t = args.n_history - 1
     terminal_margin = 1 if args.reward_mode == "required" else 0
     max_t = int(manifest["sampled_count"]) - args.horizon - 1 - terminal_margin
     t = (min_t + max_t) // 2
-    batch = dataset.window_at(args.position, t, collapse=False)
+    batch = dataset.window_at(position, t, collapse=False)
     report = {
         "dataset_episodes": len(dataset),
         "episode_index": manifest["episode_index"],

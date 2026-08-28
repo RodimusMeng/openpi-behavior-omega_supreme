@@ -365,6 +365,7 @@ CUDA_VISIBLE_DEVICES=0 uv run --no-sync python \
   --max-episodes 1 \
   --batch-size 4 \
   --device cuda \
+  --precompute-spatial-size 4 \
   --resize-mode letterbox \
   --storage-dtype float16 \
   --dry-run
@@ -385,6 +386,7 @@ CUDA_VISIBLE_DEVICES=0 uv run --no-sync python \
   --max-episodes 1 \
   --batch-size 4 \
   --device cuda \
+  --precompute-spatial-size 4 \
   --resize-mode letterbox \
   --storage-dtype float16 | tee "$LATENT_LOG"
 ```
@@ -393,6 +395,11 @@ On the confirmed 48 GB GPU, batch 4 is the conservative first measurement; do
 not increase it before inspecting `gpu_total_bytes`, `peak_allocated_bytes`,
 `peak_reserved_bytes`, and `elapsed_seconds` in the final telemetry object.
 Compute remains float32; `storage_dtype=float16` only controls the saved NPZ.
+The disk ABI deliberately uses `precompute_spatial_size=4`, producing
+`(T,60,256)` at 192x320. The released model config targets `spatial_size=2` and
+its frozen `_reshape_features()` converts those precomputed tokens at load
+time. Do not precompute directly with the model's target value: that would
+silently change the released preprocessing ABI to `(T,240,64)`.
 
 Finally verify the committed cache without constructing SD3:
 
@@ -409,6 +416,7 @@ CUDA_VISIBLE_DEVICES=0 uv run --no-sync python \
   --max-episodes 1 \
   --batch-size 4 \
   --device cuda \
+  --precompute-spatial-size 4 \
   --resize-mode letterbox \
   --storage-dtype float16 \
   --verify-cache-only

@@ -41,6 +41,7 @@ class Args:
     max_episodes: int | None = None
     batch_size: int = 4
     device: str = "cuda"
+    precompute_spatial_size: int = 4
     resize_mode: Literal["letterbox", "center-crop", "stretch"] = "letterbox"
     storage_dtype: Literal["float16", "float32"] = "float16"
     dry_run: bool = False
@@ -70,6 +71,7 @@ def _parse_args(argv: list[str] | None = None) -> Args:
     parser.add_argument("--max-episodes", type=int)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--precompute-spatial-size", type=int, default=4)
     parser.add_argument(
         "--resize-mode",
         choices=("letterbox", "center-crop", "stretch"),
@@ -93,6 +95,7 @@ def _parse_args(argv: list[str] | None = None) -> Args:
         max_episodes=parsed.max_episodes,
         batch_size=parsed.batch_size,
         device=parsed.device,
+        precompute_spatial_size=parsed.precompute_spatial_size,
         resize_mode=parsed.resize_mode,
         storage_dtype=parsed.storage_dtype,
         dry_run=parsed.dry_run,
@@ -290,7 +293,17 @@ def main(args: Args) -> None:
     if not (vae_snapshot / "config.json").is_file():
         raise FileNotFoundError(f"Pinned SD3 VAE snapshot has no config.json: {vae_snapshot}")
 
-    image_keys, image_size, model_id, spatial_size = _checkpoint_contract(checkpoint_config)
+    image_keys, image_size, model_id, model_spatial_size = _checkpoint_contract(checkpoint_config)
+    if args.precompute_spatial_size != 4:
+        raise ValueError(
+            "Released WEAVER preprocessing requires spatial_size=4 ([T,60,256] at 192x320); "
+            f"got {args.precompute_spatial_size}"
+        )
+    if model_spatial_size != 2:
+        raise ValueError(
+            "Released WEAVER model must target spatial_size=2 and reshape the precomputed spatial_size=4 ABI; "
+            f"checkpoint config declares {model_spatial_size}"
+        )
     manifests = _read_numeric_manifests(numeric_root, args)
     selected_features = tuple(manifests[0]["views"][image_key]["rgb"] for image_key in image_keys)
     if any(
@@ -303,7 +316,7 @@ def main(args: Args) -> None:
         model_id=model_id,
         revision=args.encoder_revision,
         image_size=image_size,
-        spatial_size=spatial_size,
+        spatial_size=args.precompute_spatial_size,
         compute_dtype="float32",
         storage_dtype=args.storage_dtype,
         vae_snapshot_sha256=latent_cache.directory_sha256(vae_snapshot),
@@ -352,6 +365,8 @@ def main(args: Args) -> None:
                 "selected_video_features": selected_features,
                 "encoder": dataclasses.asdict(encoder_spec),
                 "encoder_snapshot": str(encoder_snapshot),
+                "model_spatial_size": model_spatial_size,
+                "precompute_spatial_size": args.precompute_spatial_size,
                 "dry_run": args.dry_run,
                 "verify_cache_only": args.verify_cache_only,
             },
@@ -418,7 +433,7 @@ def main(args: Args) -> None:
             encoder = SD3Encoder(
                 model_name=str(encoder_snapshot),
                 image_size=image_size,
-                spatial_size=spatial_size,
+                spatial_size=args.precompute_spatial_size,
                 device=str(device),
             ).eval()
             floating_dtypes = {parameter.dtype for parameter in encoder.parameters() if parameter.is_floating_point()}
