@@ -258,6 +258,15 @@ def _device_telemetry_start(device: torch.device) -> tuple[dict[str, Any], float
     return telemetry, time.perf_counter()
 
 
+def _resolve_device(device: torch.device) -> torch.device:
+    """Give index-less CUDA requests the process's current CUDA device."""
+    if device.type != "cuda" or device.index is not None:
+        return device
+    if not torch.cuda.is_available():
+        raise RuntimeError(f"CUDA device requested but torch.cuda.is_available() is false: {device}")
+    return torch.device("cuda", torch.cuda.current_device())
+
+
 def _device_telemetry_finish(
     telemetry: dict[str, Any],
     started_at: float,
@@ -416,7 +425,7 @@ def main(args: Args) -> None:
         print("No cache misses; SD3 was not imported or constructed.", flush=True)
         return
 
-    device = torch.device(args.device)
+    device = _resolve_device(torch.device(args.device))
     telemetry, started_at = _device_telemetry_start(device)
     encoder: torch.nn.Module | None = None
 
