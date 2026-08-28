@@ -431,6 +431,41 @@ intermediate bridge after latent verification; numeric and latent artifacts are
 the durable inputs to `BehaviorPrecomputed`. Deleting it means this encoder
 preflight/verification command must regenerate it before a future re-encode.
 
+### 4C. Encode the released task feature once per official task
+
+Do not duplicate the same language embedding into every episode. Pin the model
+revision, download its snapshot, then encode the authoritative 100-task catalog
+written by the numeric pipeline:
+
+```bash
+TASK_ENCODER_MODEL=openai/clip-vit-large-patch14
+TASK_ENCODER_REV=$(python -c \
+  'from huggingface_hub import model_info; print(model_info("openai/clip-vit-large-patch14").sha)')
+TASK_ENCODER_SNAPSHOT="$WEAVER_WORK_ROOT/task-encoder/$TASK_ENCODER_REV"
+UPSTREAM_SHA=$(git -C "$UPSTREAM_WEAVER_ROOT" rev-parse HEAD)
+
+hf download "$TASK_ENCODER_MODEL" \
+  --revision "$TASK_ENCODER_REV" \
+  --local-dir "$TASK_ENCODER_SNAPSHOT"
+
+CUDA_VISIBLE_DEVICES=0 uv run --no-sync python \
+  "$OPENPI_WEAVER_ROOT/scripts/b1k/cache_weaver_task_features.py" \
+  --numeric-dir "$NUMERIC_SMOKE" \
+  --encoder-snapshot "$TASK_ENCODER_SNAPSHOT" \
+  --encoder-revision "$TASK_ENCODER_REV" \
+  --upstream-git-sha "$UPSTREAM_SHA" \
+  --adapter-git-sha "$OMEGA_SHA" \
+  --device cuda
+```
+
+The producer calls the frozen upstream `get_task_encoder()` and verifies that
+its text model and tokenizer resolved to the requested Hugging Face commit. It
+writes `task_features/features.npz` plus `task_features/manifest.json`. The
+manifest binds every exact task name and prompt, the dataset/task-catalog
+hashes, released encoder contract, pinned snapshot bytes, upstream/adapter Git
+revisions, artifact bytes, and the catalog-wide semantic SHA. Re-run with
+`--verify-cache-only` to prove a byte-level hit without encoding again.
+
 ## 5. Smoke the WEAVER batch contract
 
 Run this dataset-level gate back in the OmegaSupreme environment:
@@ -442,29 +477,33 @@ cd "$OPENPI_WEAVER_ROOT"
 
 uv run python scripts/b1k/smoke_weaver_dataset.py \
   --dataset-dir "$NUMERIC_SMOKE" \
+  --task-feature-dir "$NUMERIC_SMOKE/task_features" \
   --split train \
   --horizon 8 \
   --n-history 2 \
   --n-memory-frames 6 \
-  --t-memory 5
+  --t-memory 5 \
+  --reward-mode required
 ```
 
 Pass:
 
-- each view is `(10,P,D)`, state/action are `(10,23)`, memory state is `(6,23)`;
+- each released view is `(10,60,256)`, state/action are `(10,23)`, memory state is `(6,23)`;
 - every numeric tensor is finite;
-- task text is present;
-- there is a real `transition_valid` vector;
-- there is no `rewards` key in dynamics-only mode;
+- task text is present and `task.features` is finite `(768,)` before collation;
+- real rewards are `(10,)` and every selected `transition_valid` row is true;
 - no window or sparse-memory index crosses an episode boundary.
 
-This is a `BehaviorPrecomputed` dataset/window contract. The training entrypoint
-collates these mappings, moves tensors with the frozen upstream helper, and
-accepts task text directly; upstream `WEAVER.encode_task` performs the CLIP
-encoding for full mode. Dynamics mode does not construct or consume task/RM/
-critic inputs. `transition_valid` is consumed by the dynamics flow-loss mask;
-full mode requires every row to be valid because the frozen RM/critic have no
-transition mask.
+This is a `BehaviorPrecomputed` dataset/window contract. Supplying
+`--task-feature-dir` is explicit: the loader fails closed on changed prompt
+catalog, encoder semantics, bytes, dtype, or shape; omitting it preserves the
+older text-only path. PyTorch's default collator turns `(768,)` per item into
+the released model's `(B,768)` task ABI. This smoke uses `reward_mode=required`
+to verify the complete disk/batch ABI without starting training. A later
+dynamics-only run may explicitly select `disabled`; it does not consume
+task/RM/critic inputs. `transition_valid` is consumed by the dynamics flow-loss
+mask, while full mode requires every row to be valid because the frozen
+RM/critic have no transition mask.
 
 ## 6. What this does and does not prove
 

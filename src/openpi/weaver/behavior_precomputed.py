@@ -21,6 +21,7 @@ import numpy as np
 from openpi.weaver import b1k_dataset_adapter as _episode_adapter
 from openpi.weaver import latent_cache as _latent_cache
 from openpi.weaver import reward_contract as _reward_contract
+from openpi.weaver import task_cache as _task_cache
 
 NORM_SCHEMA_VERSION = "b1k_weaver_norm_v1"
 DEFAULT_IMAGE_KEYS = ("wrist_left", "exterior_1_left")
@@ -411,6 +412,7 @@ class BehaviorPrecomputed:
         collapse_prob: float = 0.0,
         max_trajectories: int | None = None,
         latent_root: str | Path | None = None,
+        task_feature_root: str | Path | None = None,
     ) -> None:
         self.root = Path(root).resolve()
         if latent_root is None:
@@ -485,6 +487,34 @@ class BehaviorPrecomputed:
         self.reward_mode = reward_mode
         self.collapse_prob = collapse_prob
         self.manifests = tuple(manifests)
+        self.task_features: _task_cache.LoadedTaskFeatures | None = None
+        self.task_feature_provenance: dict[str, Any] | None = None
+        if task_feature_root is not None:
+            candidate_task_root = Path(task_feature_root)
+            resolved_task_root = (
+                candidate_task_root.resolve()
+                if candidate_task_root.is_absolute()
+                else (self.root / candidate_task_root).resolve()
+            )
+            prompt_catalog = _task_cache.read_task_prompt_catalog(self.root / "task_prompts.json")
+            metadata_hashes = {str(manifest["dataset"]["metadata_sha256"]) for manifest in self.manifests}
+            if metadata_hashes != {str(prompt_catalog["dataset_metadata_sha256"])}:
+                raise ValueError("Task prompt catalog belongs to different dataset metadata")
+            self.task_features = _task_cache.load_task_feature_artifact(
+                resolved_task_root,
+                prompt_catalog=prompt_catalog,
+            )
+            self.task_feature_provenance = _task_cache.task_feature_provenance(
+                resolved_task_root,
+                self.task_features.manifest,
+            )
+            missing_prompts = {
+                str(manifest["prompt"])
+                for manifest in self.manifests
+                if str(manifest["prompt"]) not in self.task_features.by_prompt
+            }
+            if missing_prompts:
+                raise ValueError(f"Task-feature cache is missing episode prompts: {sorted(missing_prompts)}")
         self.normalize = normalize
         self.norm_stats: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
         self.norm_stats_provenance: dict[str, Any] | None = None
@@ -545,11 +575,18 @@ class BehaviorPrecomputed:
                 value[: self.n_history] = value[self.n_history - 1]
         obs["states"] = np.ascontiguousarray(states)
 
+        task: dict[str, Any] = {"text": str(manifest["prompt"])}
+        if self.task_features is not None:
+            task["features"] = np.array(
+                self.task_features.by_prompt[str(manifest["prompt"])],
+                dtype=np.float32,
+                copy=True,
+            )
         result: dict[str, Any] = {
             "obs": obs,
             "actions": np.ascontiguousarray(actions),
             "transition_valid": np.array(numeric.transition_valid[start:end], copy=True),
-            "task": {"text": str(manifest["prompt"])},
+            "task": task,
         }
         if self.reward_mode == "required":
             if numeric.rewards is None:

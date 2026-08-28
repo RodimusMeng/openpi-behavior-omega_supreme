@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 import dataclasses
 import json
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import tyro
@@ -16,6 +16,7 @@ from openpi.weaver.behavior_precomputed import BehaviorPrecomputed
 @dataclasses.dataclass(frozen=True)
 class Args:
     dataset_dir: str
+    task_feature_dir: str | None = None
     split: str = "train"
     position: int = 0
     horizon: int = 8
@@ -23,6 +24,7 @@ class Args:
     n_memory_frames: int = 0
     t_memory: int = 1
     normalize: bool = False
+    reward_mode: Literal["required", "disabled"] = "disabled"
 
 
 def _describe(value: Any) -> Any:
@@ -49,14 +51,16 @@ def main(args: Args) -> None:
         n_memory_frames=args.n_memory_frames,
         t_memory=args.t_memory,
         normalize=args.normalize,
-        reward_mode="disabled",
+        reward_mode=args.reward_mode,
         collapse_prob=0.0,
+        task_feature_root=args.task_feature_dir,
     )
     if not 0 <= args.position < len(dataset):
         raise ValueError(f"position must be in [0,{len(dataset) - 1}], got {args.position}")
     manifest = dataset.manifests[args.position]
     min_t = args.n_history - 1
-    max_t = int(manifest["sampled_count"]) - args.horizon - 1
+    terminal_margin = 1 if args.reward_mode == "required" else 0
+    max_t = int(manifest["sampled_count"]) - args.horizon - 1 - terminal_margin
     t = (min_t + max_t) // 2
     batch = dataset.window_at(args.position, t, collapse=False)
     report = {
@@ -66,6 +70,8 @@ def main(args: Args) -> None:
         "prompt": manifest["prompt"],
         "target_hz": manifest["target_hz"],
         "sampled_count": manifest["sampled_count"],
+        "task_feature_provenance": dataset.task_feature_provenance,
+        "reward_mode": args.reward_mode,
         "window_t": t,
         "window": _describe(batch),
     }

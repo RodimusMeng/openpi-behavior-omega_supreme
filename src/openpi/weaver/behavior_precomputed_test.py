@@ -11,6 +11,7 @@ from openpi.weaver import b1k_dataset_adapter as episode_adapter
 from openpi.weaver import behavior_precomputed
 from openpi.weaver import frame_cache
 from openpi.weaver import latent_cache
+from openpi.weaver import task_cache
 
 
 def _sha256(path: Path) -> str:
@@ -43,7 +44,7 @@ def _episode(index: int, *, length: int = 9, reward: bool = False, sentinel: flo
     )
 
 
-def _write_episode(root: Path, episode, *, split: str = "train") -> dict:
+def _write_episode(root: Path, episode, *, split: str = "train", latent_shape: tuple[int, int] = (3, 4)) -> dict:
     manifest = episode_adapter.episode_manifest(
         episode,
         split=split,
@@ -150,8 +151,14 @@ def _write_episode(root: Path, episode, *, split: str = "train") -> dict:
         latent_manifest_path,
         semantics=semantics,
         latents={
-            "wrist_left_features": np.broadcast_to(value + episode.episode_index, (len(value), 3, 4)),
-            "exterior_1_left_features": np.broadcast_to(value + 100 + episode.episode_index, (len(value), 3, 4)),
+            "wrist_left_features": np.broadcast_to(
+                value + episode.episode_index,
+                (len(value), *latent_shape),
+            ),
+            "exterior_1_left_features": np.broadcast_to(
+                value + 100 + episode.episode_index,
+                (len(value), *latent_shape),
+            ),
         },
     )
     return manifest
@@ -194,6 +201,32 @@ def _write_norm(root: Path) -> None:
     )
 
 
+def _write_task_features(root: Path, manifests: list[dict]) -> Path:
+    prompts = {f"task_{index}": str(manifest["prompt"]) for index, manifest in enumerate(manifests)}
+    catalog = {
+        "schema_version": task_cache.TASK_PROMPT_SCHEMA_VERSION,
+        "dataset_metadata_sha256": "a" * 64,
+        "task_catalog_sha256": "b" * 64,
+        "prompts": prompts,
+    }
+    (root / "task_prompts.json").write_text(json.dumps(catalog), encoding="utf-8")
+    encoder = task_cache.TaskEncoderSpec(
+        model_id="openai/clip-vit-large-patch14",
+        revision="c" * 40,
+        feature_dim=768,
+        snapshot_sha256="d" * 64,
+        upstream_git_sha="3e41e907",
+    )
+    semantics = task_cache.task_feature_semantics(catalog, encoder=encoder, adapter_git_sha="deadbeef")
+    feature_root = root / "task_features"
+    task_cache.write_task_feature_artifact(
+        feature_root,
+        semantics=semantics,
+        features={name: np.full(768, index + 1, dtype=np.float32) for index, name in enumerate(prompts)},
+    )
+    return feature_root
+
+
 def test_norm_stats_provenance_must_match_manifest_dataset_and_rate(tmp_path):
     manifest = _write_episode(tmp_path, _episode(0))
     _write_index(tmp_path, [manifest])
@@ -234,6 +267,32 @@ def test_dynamics_batch_matches_weaver_contract_without_fake_rewards(tmp_path):
     assert batch["task"] == {"text": "task 0"}
     assert "rewards" not in batch
     assert all(np.isfinite(value).all() for value in batch["obs"].values())
+
+
+def test_explicit_task_feature_cache_completes_released_weaver_batch_abi(tmp_path):
+    manifest = _write_episode(tmp_path, _episode(0), latent_shape=(60, 256))
+    _write_index(tmp_path, [manifest])
+    task_feature_root = _write_task_features(tmp_path, [manifest])
+    dataset = behavior_precomputed.BehaviorPrecomputed(
+        tmp_path,
+        horizon=3,
+        n_history=2,
+        normalize=False,
+        reward_mode="disabled",
+        task_feature_root=task_feature_root,
+    )
+
+    batch = dataset.window_at(0, 1)
+
+    assert batch["task"]["text"] == "task 0"
+    assert batch["task"]["features"].shape == (768,)
+    assert batch["task"]["features"].dtype == np.float32
+    assert np.isfinite(batch["task"]["features"]).all()
+    assert batch["obs"]["wrist_left_features"].shape == (5, 60, 256)
+    assert batch["obs"]["exterior_1_left_features"].shape == (5, 60, 256)
+    assert batch["obs"]["states"].shape == (5, 23)
+    assert batch["actions"].shape == (5, 23)
+    assert dataset.task_feature_provenance["semantic_sha256"]
 
 
 def test_windows_and_sparse_memory_never_cross_episode_boundaries(tmp_path):
