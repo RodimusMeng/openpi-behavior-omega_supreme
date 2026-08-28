@@ -42,7 +42,7 @@ class Args:
     batch_size: int = 4
     device: str = "cuda"
     precompute_spatial_size: int = 4
-    resize_mode: Literal["letterbox", "center-crop", "stretch"] = "letterbox"
+    resize_mode: Literal["letterbox", "center-crop", "stretch"] = "stretch"
     storage_dtype: Literal["float16", "float32"] = "float16"
     dry_run: bool = False
     verify_cache_only: bool = False
@@ -75,7 +75,7 @@ def _parse_args(argv: list[str] | None = None) -> Args:
     parser.add_argument(
         "--resize-mode",
         choices=("letterbox", "center-crop", "stretch"),
-        default="letterbox",
+        default="stretch",
     )
     parser.add_argument("--storage-dtype", choices=("float16", "float32"), default="float16")
     mode = parser.add_mutually_exclusive_group()

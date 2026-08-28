@@ -52,7 +52,7 @@ class EncoderSpec:
     storage_dtype: str
     vae_snapshot_sha256: str
     checkpoint_config_sha256: str
-    resize_mode: str = "letterbox"
+    resize_mode: str = "stretch"
     interpolation: str = "bilinear-align-corners-false"
     modality: str = "rgb"
 

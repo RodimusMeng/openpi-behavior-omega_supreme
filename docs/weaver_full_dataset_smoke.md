@@ -366,7 +366,7 @@ CUDA_VISIBLE_DEVICES=0 uv run --no-sync python \
   --batch-size 4 \
   --device cuda \
   --precompute-spatial-size 4 \
-  --resize-mode letterbox \
+  --resize-mode stretch \
   --storage-dtype float16 \
   --dry-run
 ```
@@ -387,7 +387,7 @@ CUDA_VISIBLE_DEVICES=0 uv run --no-sync python \
   --batch-size 4 \
   --device cuda \
   --precompute-spatial-size 4 \
-  --resize-mode letterbox \
+  --resize-mode stretch \
   --storage-dtype float16 | tee "$LATENT_LOG"
 ```
 
@@ -417,7 +417,7 @@ CUDA_VISIBLE_DEVICES=0 uv run --no-sync python \
   --batch-size 4 \
   --device cuda \
   --precompute-spatial-size 4 \
-  --resize-mode letterbox \
+  --resize-mode stretch \
   --storage-dtype float16 \
   --verify-cache-only
 ```
@@ -433,7 +433,10 @@ Every selected latent must be a byte-level hit. Pass also requires:
 - no NaN/OOM occurs and the telemetry reports the expected GPU name and roughly
   48 GB total memory.
 
-`letterbox` is the initial non-distorting square-to-rectangular policy. Inspect
+`stretch` is the released upstream preprocessing contract: pinned
+`datasets/preprocess_droid.py` uses OpenCV `INTER_LINEAR` to resize every source
+frame directly to 192x320. `letterbox` and `center-crop` remain available only
+for later explicit ablations; neither is the first-transfer ABI. Inspect
 first/middle/last cached RGB frames before scaling. `FRAME_SMOKE` is a deletable
 intermediate bridge after latent verification; numeric and latent artifacts are
 the durable inputs to `BehaviorPrecomputed`. Deleting it means this encoder
