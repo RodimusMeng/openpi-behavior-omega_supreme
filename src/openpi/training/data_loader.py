@@ -319,6 +319,8 @@ def create_b1k_data_loader(
         num_batches=num_batches,
         num_workers=config.num_workers,
         seed=config.seed,
+        prefetch_factor=config.prefetch_factor,
+        persistent_workers=config.persistent_workers,
     )
 
     return DataLoaderImpl(data_config, data_loader)
@@ -447,6 +449,8 @@ class TorchDataLoader:
         sampler: torch.utils.data.Sampler | None = None,
         num_batches: int | None = None,
         num_workers: int = 0,
+        prefetch_factor: int | None = None,
+        persistent_workers: bool = True,
         seed: int = 0,
         framework: str = "jax",
     ):
@@ -487,20 +491,24 @@ class TorchDataLoader:
 
         generator = torch.Generator()
         generator.manual_seed(seed)
-        self._data_loader = torch.utils.data.DataLoader(
-            typing.cast(torch.utils.data.Dataset, dataset),
+        
+        loader_kwargs = dict(
+            dataset=dataset,
             batch_size=local_batch_size,
-            shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
-            sampler=sampler,
+            shuffle=shuffle,
             num_workers=num_workers,
-            multiprocessing_context=mp_context,
-            persistent_workers=num_workers > 0,
-            prefetch_factor=1 if num_workers > 0 else None,
             collate_fn=_collate_fn,
-            worker_init_fn=_worker_init_fn,
-            drop_last=True,
-            generator=generator,
         )
+        if num_workers > 0:
+            loader_kwargs.update(
+                persistent_workers=persistent_workers,
+                multiprocessing_context="spawn",
+            )
+            if prefetch_factor is not None:
+                loader_kwargs["prefetch_factor"] = prefetch_factor
+            
+        self._data_loader = torch.utils.data.DataLoader(**loader_kwargs)
+
 
     @property
     def torch_loader(self) -> torch.utils.data.DataLoader:

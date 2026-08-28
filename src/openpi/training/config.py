@@ -611,6 +611,10 @@ class TrainConfig:
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
 
+    # PyTorch DataLoader tuning
+    prefetch_factor: int | None = None
+    persistent_workers: bool = True
+
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
     # If true, will resume training from the last checkpoint.
@@ -780,7 +784,86 @@ _CONFIGS = [
             "2026_behavior_challenge/tiancheng/checkpoints"
         ),
     ),
-    #
+    
+    TrainConfig(
+        name="pi05_b1k_full_abs",
+        model=pi0_config.Pi0Config(
+            action_horizon=32,
+            pi05=True,
+        ),
+        data=LeRobotB1KDataConfig(
+            repo_id="b1k-v3again",
+            base_config=DataConfig(
+                data_cls=_lerobot_compat.LeRobotDataset,
+                dataset_root=(
+                    "/inspire/dataset/"
+                    "behavior-1k-2026-challenge-demos/v3again"
+                ),
+                prompt_from_task=True,
+                dataset_kwargs={
+                    "tolerance_s": 5e-4,
+                    "video_backend": "pyav",
+                },
+            ),
+            robot_config_name="b1k/R1Pro",
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        save_interval=1_000,
+        keep_period=2_000,
+        num_train_steps=500_000,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir=(
+            "/inspire/hdd/project/robot-reasoning/"
+            "xiangyushun-p-xiangyushun/"
+            "2026_behavior_challenge/tiancheng/checkpoints"
+        ),
+    ),
+    
+    TrainConfig(
+        name="pi05_b1k_radio_abs", # absolute and no depth
+        model=pi0_config.Pi0Config(
+            action_horizon=32,
+            pi05=True,
+        ),
+        data=LeRobotB1KDataConfig(
+            repo_id="b1k-v3again",
+            base_config=DataConfig(
+                data_cls=_lerobot_compat.LeRobotDataset,
+                dataset_root=(
+                    "/inspire/dataset/"
+                    "behavior-1k-2026-challenge-demos/v3again"
+                ),
+                prompt_from_task=True,
+                dataset_kwargs={
+                    "tolerance_s": 5e-4,
+                    "video_backend": "pyav",
+                    "episodes": list(range(200))
+                },
+            ),
+            robot_config_name="b1k/R1Pro",
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        batch_size=64,
+        num_workers=32,
+        save_interval=2_000,
+        keep_period=2_000,
+        num_train_steps=20_000,
+        prefetch_factor=2,
+        persistent_workers=True,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir=(
+            "/inspire/hdd/project/robot-reasoning/"
+            "xiangyushun-p-xiangyushun/"
+            "2026_behavior_challenge/tiancheng/checkpoints"
+        ),
+    ),
+    
     # Fine-tuning Libero configs.
     #
     # These train configs define the hyperparameters for fine-tuning the base model on your own dataset.
