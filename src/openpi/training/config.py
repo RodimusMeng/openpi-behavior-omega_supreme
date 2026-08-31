@@ -819,11 +819,11 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_base/params"
         ),
-        batch_size=64,
+        batch_size=128,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=2.5e-6,
-            decay_steps=120_000,
+            decay_steps=100_000,
             decay_lr=2.5e-6,
         ),
         optimizer=_optimizer.AdamW(
@@ -838,10 +838,10 @@ _CONFIGS = [
         num_workers=32,
         prefetch_factor=2,
         persistent_workers=True,
-        fsdp_devices=4,
-        num_train_steps=120_000,
+        fsdp_devices=8,
+        num_train_steps=100_000,
         save_interval=10_000,
-        keep_period=10_000,
+        keep_period=20_000,
         assets_base_dir="./outputs/assets",
         checkpoint_base_dir=(
             "/inspire/hdd/project/robot-reasoning/"
