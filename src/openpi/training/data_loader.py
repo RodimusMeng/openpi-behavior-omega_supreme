@@ -273,6 +273,18 @@ def create_data_loader(
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
+    # B1K datasets live under a local LeRobot dataset_root.
+    # Route them through the B1K-specific loader so repo_id such as
+    # "b1k-v3again" is not interpreted as a Hugging Face dataset repo.
+    if isinstance(config.data, _config.LeRobotB1KDataConfig):
+        return create_b1k_data_loader(
+            config,
+            sharding=sharding,
+            shuffle=shuffle,
+            num_batches=num_batches,
+            skip_norm_stats=skip_norm_stats,
+        )
+
     if data_config.rlds_data_dir is not None:
         return create_rlds_data_loader(
             data_config,
