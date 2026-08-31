@@ -177,6 +177,26 @@ def test_build_model_preserves_configured_view_count_knob(monkeypatch):
     assert calls["model_kwargs"]["img_keys"] == ["wrist_left", "exterior_1_left", "wrist_right"]
 
 
+def test_build_model_passes_pinned_snapshot_to_upstream_clip_encoder(monkeypatch, tmp_path):
+    calls = {}
+    snapshot = tmp_path / "clip"
+    snapshot.mkdir()
+
+    class FakeClipEncoder:
+        feature_dim = 768
+
+        def __init__(self, *, model_name, device):
+            calls["clip_encoder"] = {"model_name": model_name, "device": device}
+
+    monkeypatch.setattr(upstream_runtime, "_load_upstream_api", lambda: _build_api(calls))
+    monkeypatch.setattr(upstream_runtime, "_load_clip_encoder_type", lambda: FakeClipEncoder)
+
+    upstream_runtime.build_model(_config(8), device="cpu", task_encoder_model=snapshot)
+
+    assert calls["clip_encoder"] == {"model_name": str(snapshot.resolve()), "device": "cpu"}
+    assert "task_encoder" not in calls
+
+
 class _FakeTransferReport:
     def __init__(
         self,

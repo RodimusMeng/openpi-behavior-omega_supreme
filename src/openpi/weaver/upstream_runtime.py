@@ -133,7 +133,42 @@ def _image_keys_from_config(cfg: Any) -> tuple[str, ...]:
     return tuple(cfg.dataset.img_keys)
 
 
-def build_model(config: Mapping[str, Any], *, device: str):
+def _load_clip_encoder_type():
+    try:
+        from weaver.wm.encoders import ClipEncoder  # noqa: PLC0415
+    except ImportError as exc:
+        raise UpstreamRuntimeError("Frozen WEAVER ClipEncoder is not importable from weaver.wm.encoders") from exc
+    return ClipEncoder
+
+
+def _build_task_encoder(
+    api: _UpstreamApi,
+    *,
+    device: str,
+    task_encoder_model: str | Path | None,
+):
+    """Build the frozen WEAVER task encoder, optionally from a pinned snapshot."""
+
+    if task_encoder_model is None:
+        return api.get_task_encoder(config=None, device=device)
+
+    snapshot = Path(task_encoder_model).expanduser().resolve()
+    if not snapshot.is_dir():
+        raise FileNotFoundError(f"Pinned task-encoder snapshot does not exist: {snapshot}")
+
+    clip_encoder_type = _load_clip_encoder_type()
+    return clip_encoder_type(
+        model_name=str(snapshot),
+        device=device,
+    )
+
+
+def build_model(
+    config: Mapping[str, Any],
+    *,
+    device: str,
+    task_encoder_model: str | Path | None = None,
+):
     """Build the full original WEAVER for either released 8D or B1K 23D.
 
     No model/inference/memory/SPRINT setting is reconstructed locally. The
@@ -164,7 +199,11 @@ def build_model(config: Mapping[str, Any], *, device: str):
         image_size=cfg.dataset.image_size,
         device=device,
     )
-    task_encoder = api.get_task_encoder(config=None, device=device)
+    task_encoder = _build_task_encoder(
+        api,
+        device=device,
+        task_encoder_model=task_encoder_model,
+    )
     model = api.model_type(
         img_keys=list(image_keys),
         im_encoder=im_encoder,
