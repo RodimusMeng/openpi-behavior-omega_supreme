@@ -17,6 +17,8 @@ from typing import Any
 import torch
 
 DEFAULT_WRAPPER_PREFIXES = ("module.", "_orig_mod.")
+CLIP_CHECKPOINT_TEXT_PREFIX = "task_encoder.text_encoder.text_model."
+CLIP_RUNTIME_TEXT_PREFIX = "task_encoder.text_encoder."
 
 
 @dataclasses.dataclass(frozen=True)
@@ -112,7 +114,17 @@ def normalize_state_dict_key(
                 canonical = canonical[len(prefix) :]
                 break
         else:
-            return canonical
+            break
+
+    # Transformers releases have exposed CLIPTextModel parameters both with
+    # and without an intermediate ``text_model`` module. The released WEAVER
+    # checkpoint uses the former while its frozen runtime environment exposes
+    # the latter. Canonicalize only this fully-qualified task-encoder prefix;
+    # collision detection in ``_canonicalize_state_dict`` still rejects a
+    # checkpoint containing both spellings.
+    if canonical.startswith(CLIP_CHECKPOINT_TEXT_PREFIX):
+        canonical = CLIP_RUNTIME_TEXT_PREFIX + canonical[len(CLIP_CHECKPOINT_TEXT_PREFIX) :]
+    return canonical
 
 
 def adapt_state_dict(

@@ -51,6 +51,37 @@ def test_identity_transfer_normalizes_wrapper_prefixes():
     assert merged["layer.bias"] is source_bias
 
 
+def test_identity_transfer_normalizes_released_clip_text_namespace():
+    source_weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    source_key = "task_encoder.text_encoder.text_model.embeddings.token_embedding.weight"
+    target_key = "task_encoder.text_encoder.embeddings.token_embedding.weight"
+
+    merged, report = checkpoint_transfer.adapt_state_dict(
+        {source_key: source_weight},
+        {target_key: torch.zeros_like(source_weight)},
+        require_identity=True,
+    )
+
+    assert report.is_identity_compatible
+    assert report.loaded_keys == (target_key,)
+    assert report.source_key_rewrites == (
+        checkpoint_transfer.KeyRewrite(original=source_key, canonical=target_key),
+    )
+    assert merged[target_key] is source_weight
+
+
+def test_clip_text_namespace_normalization_collision_is_rejected():
+    checkpoint_key = "task_encoder.text_encoder.text_model.final_layer_norm.weight"
+    runtime_key = "task_encoder.text_encoder.final_layer_norm.weight"
+    source = {
+        checkpoint_key: torch.ones(1),
+        runtime_key: torch.ones(1),
+    }
+
+    with pytest.raises(checkpoint_transfer.KeyNormalizationError, match="both normalize"):
+        checkpoint_transfer.adapt_state_dict(source, {runtime_key: torch.zeros(1)})
+
+
 def test_cross_dimension_transfer_keeps_exactly_nine_target_initializations():
     source = {"shared.weight": torch.ones(2, 2)}
     target = {"shared.weight": torch.zeros(2, 2)}
