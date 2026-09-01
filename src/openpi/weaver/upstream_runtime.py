@@ -152,9 +152,20 @@ def _build_task_encoder(
     if task_encoder_model is None:
         return api.get_task_encoder(config=None, device=device)
 
-    snapshot = Path(task_encoder_model).expanduser().resolve()
+    raw_snapshot = str(task_encoder_model).strip()
+    if not raw_snapshot:
+        raise ValueError("Pinned task-encoder snapshot path must be non-empty")
+    snapshot = Path(raw_snapshot).expanduser().resolve()
     if not snapshot.is_dir():
         raise FileNotFoundError(f"Pinned task-encoder snapshot does not exist: {snapshot}")
+    if not (snapshot / "config.json").is_file():
+        raise FileNotFoundError(f"Pinned task-encoder snapshot has no config.json: {snapshot}")
+    weight_files = (snapshot / "model.safetensors", snapshot / "pytorch_model.bin")
+    if not any(path.is_file() for path in weight_files):
+        raise FileNotFoundError(
+            "Pinned task-encoder snapshot has neither model.safetensors nor pytorch_model.bin: "
+            f"{snapshot}"
+        )
 
     clip_encoder_type = _load_clip_encoder_type()
     return clip_encoder_type(
@@ -194,15 +205,18 @@ def build_model(
 
     image_size: tuple[int, int] | int = cfg.dataset.image_size
     normalized_image_size = (image_size, image_size) if isinstance(image_size, int) else tuple(image_size)
-    im_encoder, train_decoder = api.get_encoder(
-        config=cfg.im_encoder,
-        image_size=cfg.dataset.image_size,
-        device=device,
-    )
+    # Validate and construct the small task encoder first. A missing or empty
+    # snapshot path must fail before the substantially larger image encoder is
+    # placed on the requested device.
     task_encoder = _build_task_encoder(
         api,
         device=device,
         task_encoder_model=task_encoder_model,
+    )
+    im_encoder, train_decoder = api.get_encoder(
+        config=cfg.im_encoder,
+        image_size=cfg.dataset.image_size,
+        device=device,
     )
     model = api.model_type(
         img_keys=list(image_keys),

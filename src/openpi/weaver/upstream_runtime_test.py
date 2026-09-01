@@ -181,6 +181,8 @@ def test_build_model_passes_pinned_snapshot_to_upstream_clip_encoder(monkeypatch
     calls = {}
     snapshot = tmp_path / "clip"
     snapshot.mkdir()
+    (snapshot / "config.json").write_text("{}", encoding="utf-8")
+    (snapshot / "model.safetensors").write_bytes(b"weights")
 
     class FakeClipEncoder:
         feature_dim = 768
@@ -195,6 +197,30 @@ def test_build_model_passes_pinned_snapshot_to_upstream_clip_encoder(monkeypatch
 
     assert calls["clip_encoder"] == {"model_name": str(snapshot.resolve()), "device": "cpu"}
     assert "task_encoder" not in calls
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_build_model_rejects_empty_pinned_snapshot_before_image_encoder(monkeypatch, value):
+    calls = {}
+    monkeypatch.setattr(upstream_runtime, "_load_upstream_api", lambda: _build_api(calls))
+
+    with pytest.raises(ValueError, match="must be non-empty"):
+        upstream_runtime.build_model(_config(8), device="cpu", task_encoder_model=value)
+
+    assert "encoder" not in calls
+
+
+def test_build_model_rejects_incomplete_pinned_snapshot_before_image_encoder(monkeypatch, tmp_path):
+    calls = {}
+    snapshot = tmp_path / "clip"
+    snapshot.mkdir()
+    (snapshot / "config.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(upstream_runtime, "_load_upstream_api", lambda: _build_api(calls))
+
+    with pytest.raises(FileNotFoundError, match="neither model"):
+        upstream_runtime.build_model(_config(8), device="cpu", task_encoder_model=snapshot)
+
+    assert "encoder" not in calls
 
 
 class _FakeTransferReport:
