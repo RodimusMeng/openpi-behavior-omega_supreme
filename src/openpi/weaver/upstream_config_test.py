@@ -117,6 +117,22 @@ def test_behavior_transfer_accepts_legacy_release_with_both_action_fields_omitte
     assert target["dataset"]["n_actions"] == 23
 
 
+def test_released_checkpoint_config_materializes_only_valid_legacy_release_metadata() -> None:
+    source = _released_config()
+    del source["defaults"]["dataset"]["n_states"]
+    del source["defaults"]["dataset"]["n_actions"]
+
+    concrete, inferred = upstream_config.released_checkpoint_config(source)
+
+    assert concrete["dataset"]["n_states"] == 8
+    assert concrete["dataset"]["n_actions"] == 8
+    assert inferred == ("n_states", "n_actions")
+
+    source["defaults"]["horizon"] = 12
+    with pytest.raises(ValueError, match="frozen DROID release architecture"):
+        upstream_config.released_checkpoint_config(source)
+
+
 def test_behavior_transfer_infers_one_missing_legacy_action_metadata_field() -> None:
     source = _released_config()
     del source["defaults"]["dataset"]["n_states"]

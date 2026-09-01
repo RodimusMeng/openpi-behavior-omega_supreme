@@ -80,6 +80,19 @@ def checkpoint_defaults(raw_config: Mapping[str, Any]) -> dict[str, Any]:
     return copy.deepcopy(dict(concrete))
 
 
+def released_checkpoint_config(raw_config: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Return a validated concrete release config with omitted 8D metadata materialized.
+
+    The published DROID release may omit ``dataset.n_states`` and
+    ``dataset.n_actions``. Inference is allowed only when every other frozen
+    release architecture field matches; arbitrary incomplete configs still
+    fail closed.
+    """
+
+    concrete = checkpoint_defaults(raw_config)
+    return _materialize_released_state_action_metadata(concrete)
+
+
 def architecture_contract(config: Mapping[str, Any]) -> ArchitectureContract:
     """Extract and validate every currently known shape-bearing contract."""
 
@@ -134,8 +147,7 @@ def build_behavior_config(
     explicitly after the two-view identity/transfer gates pass.
     """
 
-    source_cfg = checkpoint_defaults(checkpoint_config)
-    source_cfg, inferred_source_fields = _materialize_released_state_action_metadata(source_cfg)
+    source_cfg, inferred_source_fields = released_checkpoint_config(checkpoint_config)
     source_contract = architecture_contract(source_cfg)
     target_keys = _string_tuple(image_keys, name="image_keys")
     if target_keys != tuple(DEFAULT_IMAGE_KEYS):
@@ -230,9 +242,8 @@ def _materialize_released_state_action_metadata(
             "match the frozen DROID release architecture"
         )
     for name in ("n_states", "n_actions"):
-        if name not in missing and dataset[name] not in (
-            WEAVER_RELEASE_STATE_DIM if name == "n_states" else WEAVER_RELEASE_ACTION_DIM,
-        ):
+        expected_dimension = WEAVER_RELEASE_STATE_DIM if name == "n_states" else WEAVER_RELEASE_ACTION_DIM
+        if name not in missing and dataset[name] != expected_dimension:
             raise ValueError(
                 f"Cannot infer omitted WEAVER release metadata: present dataset.{name}="
                 f"{dataset[name]!r} is not the frozen 8D release value"

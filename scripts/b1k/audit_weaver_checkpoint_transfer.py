@@ -153,7 +153,7 @@ def main() -> None:
 
     released_config = _read_yaml(config_path)
 
-    released_concrete = upstream_config.checkpoint_defaults(released_config)
+    released_concrete, inferred_source_fields = upstream_config.released_checkpoint_config(released_config)
     released_contract = upstream_config.architecture_contract(released_concrete)
 
     if (released_contract.n_states, released_contract.n_actions) != (8, 8):
@@ -261,6 +261,7 @@ def main() -> None:
             "task_encoder_model": str(task_encoder_path),
             "n_states": released_contract.n_states,
             "n_actions": released_contract.n_actions,
+            "inferred_config_fields": list(inferred_source_fields),
         },
         "identity_gate": {
             "passed": True,
