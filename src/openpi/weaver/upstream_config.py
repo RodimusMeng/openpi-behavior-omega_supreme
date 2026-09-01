@@ -31,6 +31,7 @@ WEAVER_RELEASE_HORIZON = 8
 WEAVER_RELEASE_N_HISTORY = 2
 WEAVER_RELEASE_N_MEMORY_FRAMES = 6
 WEAVER_RELEASE_T_MEMORY = 5
+WEAVER_RELEASE_USE_PRECOMPUTED_FEATURES = True
 BEHAVIOR_STATE_REPRESENTATION = "r1pro_compact_state_v1"
 BEHAVIOR_ACTION_REPRESENTATION = "r1pro_compact_state_delta_v1"
 
@@ -90,7 +91,7 @@ def released_checkpoint_config(raw_config: Mapping[str, Any]) -> tuple[dict[str,
     """
 
     concrete = checkpoint_defaults(raw_config)
-    return _materialize_released_state_action_metadata(concrete)
+    return _materialize_released_metadata(concrete)
 
 
 def architecture_contract(config: Mapping[str, Any]) -> ArchitectureContract:
@@ -207,10 +208,10 @@ def build_behavior_config(
     )
 
 
-def _materialize_released_state_action_metadata(
+def _materialize_released_metadata(
     config: dict[str, Any],
 ) -> tuple[dict[str, Any], tuple[str, ...]]:
-    """Materialize omitted 8D metadata from the known released WEAVER format.
+    """Materialize omitted runtime metadata from the known released WEAVER format.
 
     ``architecture_contract`` intentionally remains fail-closed. This helper
     is only used by the BEHAVIOR transfer builder, where the input is the
@@ -221,8 +222,12 @@ def _materialize_released_state_action_metadata(
     dataset = config.get("dataset")
     if not isinstance(dataset, dict):
         return config, ()
-    missing = tuple(name for name in ("n_states", "n_actions") if name not in dataset)
+    missing_dimensions = tuple(name for name in ("n_states", "n_actions") if name not in dataset)
+    missing_precomputed = ("use_precomputed_features",) if "use_precomputed_features" not in config else ()
+    missing = (*missing_dimensions, *missing_precomputed)
     if not missing:
+        if config["use_precomputed_features"] is not WEAVER_RELEASE_USE_PRECOMPUTED_FEATURES:
+            raise ValueError("Frozen DROID release requires use_precomputed_features=True")
         return config, ()
     try:
         release_shape = (
@@ -243,7 +248,7 @@ def _materialize_released_state_action_metadata(
         )
     for name in ("n_states", "n_actions"):
         expected_dimension = WEAVER_RELEASE_STATE_DIM if name == "n_states" else WEAVER_RELEASE_ACTION_DIM
-        if name not in missing and dataset[name] != expected_dimension:
+        if name not in missing_dimensions and dataset[name] != expected_dimension:
             raise ValueError(
                 f"Cannot infer omitted WEAVER release metadata: present dataset.{name}="
                 f"{dataset[name]!r} is not the frozen 8D release value"
@@ -255,7 +260,12 @@ def _materialize_released_state_action_metadata(
         "n_actions": WEAVER_RELEASE_ACTION_DIM,
     }
     for name in missing:
-        materialized_dataset[name] = defaults[name]
+        if name in defaults:
+            materialized_dataset[name] = defaults[name]
+    if "use_precomputed_features" in missing_precomputed:
+        materialized["use_precomputed_features"] = WEAVER_RELEASE_USE_PRECOMPUTED_FEATURES
+    elif config["use_precomputed_features"] is not WEAVER_RELEASE_USE_PRECOMPUTED_FEATURES:
+        raise ValueError("Frozen DROID release requires use_precomputed_features=True")
     return materialized, missing
 
 

@@ -12,6 +12,7 @@ def _released_config() -> dict:
             "n_history": 2,
             "n_memory_frames": 6,
             "t_memory": 5,
+            "use_precomputed_features": True,
             "dataset": {
                 "name": "DROID",
                 "path": "/droid",
@@ -121,15 +122,25 @@ def test_released_checkpoint_config_materializes_only_valid_legacy_release_metad
     source = _released_config()
     del source["defaults"]["dataset"]["n_states"]
     del source["defaults"]["dataset"]["n_actions"]
+    del source["defaults"]["use_precomputed_features"]
 
     concrete, inferred = upstream_config.released_checkpoint_config(source)
 
     assert concrete["dataset"]["n_states"] == 8
     assert concrete["dataset"]["n_actions"] == 8
-    assert inferred == ("n_states", "n_actions")
+    assert concrete["use_precomputed_features"] is True
+    assert inferred == ("n_states", "n_actions", "use_precomputed_features")
 
     source["defaults"]["horizon"] = 12
     with pytest.raises(ValueError, match="frozen DROID release architecture"):
+        upstream_config.released_checkpoint_config(source)
+
+
+def test_released_checkpoint_config_rejects_explicit_non_release_precomputed_mode() -> None:
+    source = _released_config()
+    source["defaults"]["use_precomputed_features"] = False
+
+    with pytest.raises(ValueError, match="use_precomputed_features=True"):
         upstream_config.released_checkpoint_config(source)
 
 
