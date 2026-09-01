@@ -66,7 +66,8 @@ def _read_yaml(path: Path) -> dict[str, Any]:
 
 def _make_23d_config(source: dict[str, Any]) -> dict[str, Any]:
     """Copy released config and change only state/action dimensionality."""
-    target = copy.deepcopy(upstream_config.checkpoint_defaults(source))
+    released, _ = upstream_config.released_checkpoint_config(source)
+    target = copy.deepcopy(released)
     dataset = target.get("dataset")
     if not isinstance(dataset, dict):
         raise TypeError("Released config must contain a dataset mapping")

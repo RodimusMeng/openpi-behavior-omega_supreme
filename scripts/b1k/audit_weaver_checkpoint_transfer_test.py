@@ -31,11 +31,18 @@ audit = _load_script()
 
 def test_make_23d_config_handles_saved_and_repo_style_configs_without_mutation():
     concrete = {
+        "horizon": 8,
+        "n_history": 2,
+        "n_memory_frames": 6,
+        "t_memory": 5,
         "dataset": {
+            "name": "DROID",
             "img_keys": ["wrist_left", "exterior_1_left"],
+            "image_size": [192, 320],
             "n_states": 8,
             "n_actions": 8,
-        }
+        },
+        "im_encoder": {"spatial_size": 2},
     }
 
     for source in (concrete, {"defaults": concrete}):
@@ -44,6 +51,28 @@ def test_make_23d_config_handles_saved_and_repo_style_configs_without_mutation()
         assert target["dataset"]["n_states"] == 23
         assert target["dataset"]["n_actions"] == 23
         assert target["dataset"]["img_keys"] == ["wrist_left", "exterior_1_left"]
+        assert target["use_precomputed_features"] is True
 
     assert concrete["dataset"]["n_states"] == 8
     assert concrete["dataset"]["n_actions"] == 8
+
+
+def test_make_23d_config_materializes_omitted_released_dimensions_and_runtime_mode():
+    source = {
+        "horizon": 8,
+        "n_history": 2,
+        "n_memory_frames": 6,
+        "t_memory": 5,
+        "dataset": {
+            "name": "DROID",
+            "img_keys": ["wrist_left", "exterior_1_left"],
+            "image_size": [192, 320],
+        },
+        "im_encoder": {"spatial_size": 2},
+    }
+
+    target = audit._make_23d_config(source)  # noqa: SLF001
+
+    assert target["dataset"]["n_states"] == 23
+    assert target["dataset"]["n_actions"] == 23
+    assert target["use_precomputed_features"] is True
