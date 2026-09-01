@@ -30,6 +30,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint-config", required=True)
     parser.add_argument("--pretrained-dir", required=True)
+    parser.add_argument("--task-encoder-model", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--dataset-dir", required=True)
     parser.add_argument("--norm-stats-path")
@@ -147,7 +148,11 @@ def run(
             lineage=lineage,
             norm_provenance=norm_provenance,
         )
-    model = build_model(config, device=args.device)
+    model = build_model(
+        config,
+        device=args.device,
+        task_encoder_model=args.task_encoder_model,
+    )
     load_dir = output_dir if args.resume else Path(args.pretrained_dir).expanduser().resolve()
     load_mode = "resume" if args.resume else "b1k_23d_fresh"
     load_result = load_checkpoint_into_model(
@@ -188,6 +193,7 @@ def run(
         "config_transfer": dataclasses.asdict(config_report),
         "checkpoint_load": checkpoint_load_report,
         "training_mode": args.mode,
+        "task_encoder_model": str(Path(args.task_encoder_model).expanduser().resolve()),
         "resume": bool(args.resume),
         "dataset_lineage": lineage,
         "norm_stats_provenance": norm_provenance,

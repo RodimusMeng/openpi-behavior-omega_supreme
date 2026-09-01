@@ -75,6 +75,8 @@ def _args(tmp_path, *extra):
             str(checkpoint_config),
             "--pretrained-dir",
             str(tmp_path / "pretrained"),
+            "--task-encoder-model",
+            str(tmp_path / "task-encoder"),
             "--output-dir",
             str(tmp_path / "output"),
             "--dataset-dir",
