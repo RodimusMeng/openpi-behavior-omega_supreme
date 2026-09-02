@@ -26,6 +26,8 @@ class Args:
     n_memory_frames: int = 0
     t_memory: int = 1
     normalize: bool = False
+    norm_stats_path: str | None = None
+    hybrid_action_contract: str | None = None
     reward_mode: Literal["required", "disabled"] = "disabled"
 
 
@@ -53,10 +55,12 @@ def main(args: Args) -> None:
         n_memory_frames=args.n_memory_frames,
         t_memory=args.t_memory,
         normalize=args.normalize,
+        norm_stats_path=args.norm_stats_path,
         reward_mode=args.reward_mode,
         collapse_prob=0.0,
         latent_root=args.latent_dir,
         task_feature_root=args.task_feature_dir,
+        hybrid_action_contract_path=args.hybrid_action_contract,
     )
     position = args.position
     if args.episode_index is not None:
@@ -86,6 +90,8 @@ def main(args: Args) -> None:
         "target_hz": manifest["target_hz"],
         "sampled_count": manifest["sampled_count"],
         "task_feature_provenance": dataset.task_feature_provenance,
+        "action_representation": dataset.action_representation,
+        "hybrid_action_provenance": dataset.hybrid_action_provenance,
         "reward_mode": args.reward_mode,
         "window_t": t,
         "window": _describe(batch),
