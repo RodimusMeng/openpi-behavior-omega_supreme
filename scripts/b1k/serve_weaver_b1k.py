@@ -25,6 +25,7 @@ import yaml
 from openpi.weaver import b1k_contract
 from openpi.weaver import candidate_pool
 from openpi.weaver import causal_action_adapter
+from openpi.weaver import hybrid_action
 from openpi.weaver import steering_runtime
 from openpi.weaver import upstream_config
 from openpi.weaver import upstream_runtime
@@ -168,7 +169,7 @@ class Args:
     policy_dir: str
     weaver_config: str
     weaver_checkpoint: str
-    adapter_checkpoint: str
+    hybrid_action_contract: str
     norm_stats: str
     dataset_dir: str
     prompt: str | None = None
@@ -186,13 +187,20 @@ class Args:
     use_ema: bool = True
 
 
-def _load_norm(path: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _load_norm(
+    path: str | Path, *, expected_hybrid_contract: hybrid_action.HybridActionContract
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     payload = yaml.safe_load(Path(path).expanduser().resolve().read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or payload.get("source_split") != "train":
         raise ValueError("WEAVER norm stats must be a train-split JSON artifact")
     stats = payload.get("norm_stats")
     if not isinstance(stats, dict):
         raise ValueError("norm_stats artifact has no norm_stats mapping")
+    provenance = payload.get("hybrid_action_contract")
+    if not isinstance(provenance, dict) or provenance.get("source_audit_sha256") != (
+        expected_hybrid_contract.source_audit_sha256
+    ):
+        raise ValueError("WEAVER norm stats were not computed from the selected hybrid action contract")
 
     def pair(name: str, representation: str) -> tuple[np.ndarray, np.ndarray]:
         value = stats.get(name)
@@ -207,7 +215,7 @@ def _load_norm(path: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np
         return mean, std
 
     state_mean, state_std = pair("state", "r1pro_compact_state_v1")
-    action_mean, action_std = pair("actions", "r1pro_compact_state_delta_v1")
+    action_mean, action_std = pair("actions", hybrid_action.HYBRID_REPRESENTATION)
     return state_mean, state_std, action_mean, action_std
 
 
@@ -244,19 +252,6 @@ def _resize_batch(batch: torch.Tensor, size: tuple[int, int], mode: str) -> torc
     return result
 
 
-def _load_adapter(path: str | Path, device: str) -> tuple[Any, causal_action_adapter.AdapterNormalization]:
-    checkpoint = torch.load(Path(path).expanduser().resolve(), map_location="cpu", weights_only=False)
-    if checkpoint.get("schema_version") != causal_action_adapter.ADAPTER_SCHEMA:
-        raise ValueError("Unsupported causal adapter checkpoint schema")
-    spec = causal_action_adapter.AdapterSpec(**checkpoint["spec"])
-    normalization = causal_action_adapter.AdapterNormalization.from_dict(checkpoint["normalization"])
-    model = causal_action_adapter.build_torch_model(spec)
-    model.load_state_dict(checkpoint["model"], strict=True)
-    model.to(device).eval()
-    return model, normalization
-
-
-
 class _RawCandidatePolicy:
     """Bridge raw evaluator observations to the existing OpenPI infer API."""
 
@@ -274,15 +269,14 @@ class _RawCandidatePolicy:
 class OnlineWeaverPolicy:
     """Stateful 5 Hz context/history buffer around the same-pool selector."""
 
-    def __init__(self, *, base_policy: Any, processor: Any, model: Any, adapter: Any,
-                 adapter_norm: causal_action_adapter.AdapterNormalization, state_mean: np.ndarray,
+    def __init__(self, *, base_policy: Any, processor: Any, model: Any,
+                 hybrid_contract: hybrid_action.HybridActionContract, state_mean: np.ndarray,
                  state_std: np.ndarray, action_mean: np.ndarray, action_std: np.ndarray,
                  task_prompt: str, contract: b1k_contract.B1KWeaverContract, args: Args) -> None:
         self.base_policy = base_policy
         self.processor = processor
         self.model = model
-        self.adapter = adapter
-        self.adapter_norm = adapter_norm
+        self.hybrid_contract = hybrid_contract
         self.state_mean, self.state_std = state_mean, state_std
         self.action_mean, self.action_std = action_mean, action_std
         self.task_prompt = task_prompt
@@ -392,10 +386,10 @@ class OnlineWeaverPolicy:
                                                             num_candidates=self.args.num_candidates, action_dim=23)
             current_state = self.contract.extract_state(np.asarray(observation["robot_r1::proprio"]))
             edges = np.arange(pool.actions.shape[1] + 1, dtype=np.float64) / self.args.control_hz
-            adapted = causal_action_adapter.adapt_candidate_pool(
-                pool, self.adapter, self.adapter_norm, current_state, edges,
+            adapted = causal_action_adapter.adapt_candidate_pool_hybrid(
+                pool, self.hybrid_contract, current_state, edges,
                 weaver_action_mean=self.action_mean, weaver_action_std=self.action_std,
-                device=self.args.device, target_hz=self.args.target_hz,
+                target_hz=self.args.target_hz,
                 max_horizon=self.args.imagination_horizon,
             )
             context, history, memory = self._context()
@@ -436,7 +430,7 @@ def main(args: Args) -> None:
         "policy_dir": args.policy_dir,
         "weaver_config": args.weaver_config,
         "weaver_checkpoint": args.weaver_checkpoint,
-        "adapter_checkpoint": args.adapter_checkpoint,
+        "hybrid_action_contract": args.hybrid_action_contract,
         "norm_stats": args.norm_stats,
         "dataset_dir": args.dataset_dir,
     }
@@ -464,8 +458,10 @@ def main(args: Args) -> None:
     if args.use_ema:
         model.ema.ema.copy_to(parameter for parameter in model.parameters() if parameter.requires_grad)
     model.eval()
-    adapter_model, adapter_norm = _load_adapter(args.adapter_checkpoint, args.device)
-    state_mean, state_std, action_mean, action_std = _load_norm(args.norm_stats)
+    hybrid_contract = hybrid_action.load_audited_contract(args.hybrid_action_contract)
+    state_mean, state_std, action_mean, action_std = _load_norm(
+        args.norm_stats, expected_hybrid_contract=hybrid_contract
+    )
 
     policy_cfg = __import__("openpi.training.config", fromlist=["get_config"]).get_config(args.policy_config)
     task_repo_id = f"{task_bucket}/{task_name}"
@@ -481,8 +477,8 @@ def main(args: Args) -> None:
     processor = B1KPolicyWrapper(policy=base, robot=args.robot, text_prompt=prompt,
                                  control_mode="receding_horizon", action_horizon=args.action_horizon,
                                  max_len=int(policy_cfg.model.action_horizon))
-    policy = OnlineWeaverPolicy(base_policy=base, processor=processor, model=model, adapter=adapter_model,
-                                adapter_norm=adapter_norm, state_mean=state_mean, state_std=state_std,
+    policy = OnlineWeaverPolicy(base_policy=base, processor=processor, model=model,
+                                hybrid_contract=hybrid_contract, state_mean=state_mean, state_std=state_std,
                                 action_mean=action_mean, action_std=action_std, task_prompt=prompt,
                                 contract=b1k_contract.build_r1pro_contract(), args=args)
     policy.set_model_config(config)

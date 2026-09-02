@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 
 from openpi.weaver import b1k_dataset_adapter as _episode_adapter
+from openpi.weaver import hybrid_action
 from openpi.weaver.behavior_precomputed import NORM_SCHEMA_VERSION
 from openpi.weaver.behavior_precomputed import NumericEpisode
 
@@ -69,6 +70,7 @@ def build_norm_stats(
     train_manifest_sha256: str,
     min_std: float = 1e-6,
     clamp_small_std: bool = False,
+    hybrid_contract: hybrid_action.HybridActionContract | None = None,
 ) -> dict[str, Any]:
     """Compute upstream-compatible stats without loading all episodes at once."""
 
@@ -91,7 +93,12 @@ def build_norm_stats(
     episode_count = 0
     for episode in episodes:
         state_moments.update(episode.states)
-        action_moments.update(episode.actions[episode.transition_valid])
+        episode_actions = (
+            hybrid_action.materialize_episode_actions(episode, hybrid_contract)
+            if hybrid_contract is not None
+            else episode.actions
+        )
+        action_moments.update(episode_actions[episode.transition_valid])
         episode_count += 1
     if episode_count == 0:
         raise ValueError("No train episodes were provided for normalization")
@@ -125,11 +132,16 @@ def build_norm_stats(
                 "zero_std_mask": state_small.tolist(),
             },
             "actions": {
-                "representation": _episode_adapter.STATE_DELTA_ACTION_REPRESENTATION,
+                "representation": (
+                    hybrid_action.HYBRID_REPRESENTATION
+                    if hybrid_contract is not None
+                    else _episode_adapter.STATE_DELTA_ACTION_REPRESENTATION
+                ),
                 "count": action_moments.count,
                 "mean": action_moments.mean.tolist(),
                 "std": action_std.tolist(),
                 "zero_std_mask": action_small.tolist(),
             },
         },
+        "hybrid_action_contract": hybrid_contract.provenance() if hybrid_contract is not None else None,
     }

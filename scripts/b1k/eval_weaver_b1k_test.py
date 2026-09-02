@@ -65,6 +65,8 @@ def _args(tmp_path: Path, *extra: str):
             "identity",
             "--dataset-dir",
             str(tmp_path / "dataset"),
+            "--hybrid-action-contract",
+            str(tmp_path / "action-audit.json"),
             "--output-dir",
             str(tmp_path / "output"),
             *extra,

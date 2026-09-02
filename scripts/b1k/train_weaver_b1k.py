@@ -34,6 +34,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--dataset-dir", required=True)
     parser.add_argument("--norm-stats-path")
+    parser.add_argument("--hybrid-action-contract", required=True)
     parser.add_argument("--mode", choices=("full", "dynamics"), default="full")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--split", choices=("train",), default="train")
@@ -110,6 +111,7 @@ def run(
         collapse_prob=float(dataset_cfg.get("collapse_prob", 0.0)),
         max_trajectories=args.max_trajectories,
         latent_root=dataset_cfg.get("latent_root"),
+        hybrid_action_contract_path=args.hybrid_action_contract,
     )
     if args.split != "train":
         raise ValueError("WEAVER production training is train-split only; held-out val/test are evaluation-only")
@@ -117,6 +119,9 @@ def run(
     norm_provenance = getattr(dataset, "norm_stats_provenance", None)
     if not isinstance(norm_provenance, Mapping):
         raise ValueError("Normalized WEAVER training requires auditable norm_stats provenance")
+    hybrid_provenance = getattr(dataset, "hybrid_action_provenance", None)
+    if not isinstance(hybrid_provenance, Mapping):
+        raise ValueError("Formal BEHAVIOR WEAVER training requires a hybrid causal action contract")
 
     training_cfg = config["training"]
     batch_size = int(training_cfg["batch_size"])
@@ -147,6 +152,7 @@ def run(
             config=config,
             lineage=lineage,
             norm_provenance=norm_provenance,
+            hybrid_provenance=hybrid_provenance,
         )
     model = build_model(
         config,
@@ -199,6 +205,7 @@ def run(
         "resume": bool(args.resume),
         "dataset_lineage": lineage,
         "norm_stats_provenance": norm_provenance,
+        "hybrid_action_provenance": hybrid_provenance,
     }
     _atomic_write_json(output_dir / "initialization_report.json", transfer_payload)
     result = training_runtime.train(
@@ -212,6 +219,7 @@ def run(
             **config,
             "weaver_lineage": lineage,
             "weaver_norm_provenance": norm_provenance,
+            "weaver_hybrid_action_provenance": hybrid_provenance,
         },
         start_step=start_step,
     )
@@ -228,6 +236,7 @@ def run(
         "split": args.split,
         "dataset_lineage": lineage,
         "norm_stats_provenance": norm_provenance,
+        "hybrid_action_provenance": hybrid_provenance,
         "tiny_overfit_batches": args.tiny_overfit_batches,
         "tiny_overfit_steps": args.tiny_overfit_steps,
         "last_step": dataclasses.asdict(result.reports[-1]) if result.reports else None,
@@ -268,6 +277,7 @@ def _assert_resume_contract(
     config: Mapping[str, Any],
     lineage: Mapping[str, Any],
     norm_provenance: Mapping[str, Any],
+    hybrid_provenance: Mapping[str, Any],
 ) -> None:
     """Reject resume when saved data/model/optimizer semantics changed."""
 
@@ -287,8 +297,15 @@ def _assert_resume_contract(
     saved_norm = saved.get("weaver_norm_provenance")
     if _canonical_provenance(saved_norm) != _canonical_provenance(norm_provenance):
         raise ValueError("Resume normalization provenance differs from the saved checkpoint")
+    saved_hybrid = saved.get("weaver_hybrid_action_provenance")
+    if _canonical_provenance(saved_hybrid) != _canonical_provenance(hybrid_provenance):
+        raise ValueError("Resume hybrid action contract differs from the saved checkpoint")
 
-    saved_config = {key: value for key, value in saved.items() if key not in {"weaver_lineage", "weaver_norm_provenance"}}
+    saved_config = {
+        key: value
+        for key, value in saved.items()
+        if key not in {"weaver_lineage", "weaver_norm_provenance", "weaver_hybrid_action_provenance"}
+    }
     if _canonical_config(saved_config) != _canonical_config(config):
         raise ValueError("Resume configuration differs from the saved checkpoint config")
 
@@ -317,6 +334,12 @@ def _canonical_provenance(value: Any) -> Any:
         return None
     normalized = dict(value)
     normalized.pop("path", None)
+    normalized.pop("source_audit_path", None)
+    nested = normalized.get("hybrid_action_contract")
+    if isinstance(nested, Mapping):
+        nested = dict(nested)
+        nested.pop("source_audit_path", None)
+        normalized["hybrid_action_contract"] = nested
     return _canonical(normalized)
 
 

@@ -81,6 +81,8 @@ def _args(tmp_path, *extra):
             str(tmp_path / "output"),
             "--dataset-dir",
             str(tmp_path / "dataset"),
+            "--hybrid-action-contract",
+            str(tmp_path / "action-audit.json"),
             *extra,
         ]
     )
@@ -267,17 +269,40 @@ def _norm_provenance() -> dict:
     }
 
 
+def _hybrid_provenance() -> dict:
+    return {
+        "source_audit_path": "/new/dataset/action-audit.json",
+        "source_audit_sha256": "e" * 64,
+        "schema_version": "b1k_weaver_hybrid_causal_action_v1",
+        "representation": "r1pro_21d_phase_affine_delta_plus_2d_binary_gripper_command_v1",
+    }
+
+
 def test_resume_contract_accepts_relocated_data_paths(tmp_path: Path) -> None:
-    saved = {**_resume_config(), "weaver_lineage": _lineage(), "weaver_norm_provenance": _norm_provenance()}
+    saved = {
+        **_resume_config(),
+        "weaver_lineage": _lineage(),
+        "weaver_norm_provenance": _norm_provenance(),
+        "weaver_hybrid_action_provenance": _hybrid_provenance(),
+    }
     (tmp_path / "config.yaml").write_text(yaml.safe_dump(saved), encoding="utf-8")
     train_script._assert_resume_contract(
-        tmp_path, config=_resume_config(), lineage=_lineage(), norm_provenance=_norm_provenance()
+        tmp_path,
+        config=_resume_config(),
+        lineage=_lineage(),
+        norm_provenance=_norm_provenance(),
+        hybrid_provenance=_hybrid_provenance(),
     )
 
 
 @pytest.mark.parametrize("field", ["max_lr", "norm_stats", "lineage"])
 def test_resume_contract_rejects_semantic_changes(tmp_path: Path, field: str) -> None:
-    saved = {**_resume_config(), "weaver_lineage": _lineage(), "weaver_norm_provenance": _norm_provenance()}
+    saved = {
+        **_resume_config(),
+        "weaver_lineage": _lineage(),
+        "weaver_norm_provenance": _norm_provenance(),
+        "weaver_hybrid_action_provenance": _hybrid_provenance(),
+    }
     (tmp_path / "config.yaml").write_text(yaml.safe_dump(saved), encoding="utf-8")
     current_config = _resume_config()
     current_lineage = _lineage()
@@ -294,11 +319,16 @@ def test_resume_contract_rejects_semantic_changes(tmp_path: Path, field: str) ->
             config=current_config,
             lineage=current_lineage,
             norm_provenance=current_norm,
+            hybrid_provenance=_hybrid_provenance(),
         )
 
 
 def test_resume_contract_requires_saved_config(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="missing its saved config"):
         train_script._assert_resume_contract(
-            tmp_path, config=_resume_config(), lineage=_lineage(), norm_provenance=_norm_provenance()
+            tmp_path,
+            config=_resume_config(),
+            lineage=_lineage(),
+            norm_provenance=_norm_provenance(),
+            hybrid_provenance=_hybrid_provenance(),
         )

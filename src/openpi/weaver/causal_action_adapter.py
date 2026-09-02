@@ -20,6 +20,7 @@ import numpy as np
 
 from openpi.weaver import b1k_dataset_adapter
 from openpi.weaver import candidate_pool
+from openpi.weaver import hybrid_action
 from openpi.weaver.behavior_precomputed import load_numeric_episode
 
 ADAPTER_SCHEMA = "b1k_causal_policy_action_adapter_v1"
@@ -145,6 +146,7 @@ class AdaptedCandidateActions:
     interval_edges_s: np.ndarray
     source_pool_observation_digest: str | None = None
     source_action_time_edges_sha256: str | None = None
+    action_representation: str = "r1pro_compact_state_delta_v1"
 
     def __post_init__(self) -> None:
         raw = _finite_array(self.canonical_deltas, name="canonical_deltas", ndim=3).astype(np.float32, copy=True)
@@ -597,6 +599,42 @@ def adapt_candidate_pool(
         interval_edges_s=segmented.interval_edges_s,
         source_pool_observation_digest=pool.observation_digest,
         source_action_time_edges_sha256=action_time_edges_sha256(action_time_edges_s),
+    )
+
+
+def adapt_candidate_pool_hybrid(
+    pool: candidate_pool.CandidatePool,
+    contract: hybrid_action.HybridActionContract,
+    current_state: np.ndarray,
+    action_time_edges_s: np.ndarray,
+    *,
+    weaver_action_mean: np.ndarray,
+    weaver_action_std: np.ndarray,
+    target_hz: float = 5.0,
+    max_horizon: int | None = None,
+) -> AdaptedCandidateActions:
+    """Convert a frozen policy pool with the audited deterministic hybrid contract."""
+
+    segmented = segment_candidate_actions(
+        pool.actions,
+        action_time_edges_s,
+        target_hz=target_hz,
+        max_horizon=max_horizon,
+    )
+    canonical = hybrid_action.predict_candidate_actions(contract, current_state, segmented)
+    normalized = normalize_for_weaver(
+        canonical,
+        weaver_action_mean=weaver_action_mean,
+        weaver_action_std=weaver_action_std,
+    )
+    return AdaptedCandidateActions(
+        canonical_deltas=canonical,
+        normalized_weaver_actions=normalized,
+        source_pool_actions_sha256=pool.actions_sha256,
+        interval_edges_s=segmented.interval_edges_s,
+        source_pool_observation_digest=pool.observation_digest,
+        source_action_time_edges_sha256=action_time_edges_sha256(action_time_edges_s),
+        action_representation=hybrid_action.HYBRID_REPRESENTATION,
     )
 
 

@@ -19,6 +19,7 @@ from typing import Any
 import numpy as np
 
 from openpi.weaver import b1k_dataset_adapter as _episode_adapter
+from openpi.weaver import hybrid_action as _hybrid_action
 from openpi.weaver import latent_cache as _latent_cache
 from openpi.weaver import reward_contract as _reward_contract
 from openpi.weaver import task_cache as _task_cache
@@ -326,6 +327,7 @@ def _load_norm_stats(
     expected_manifest_sha256: str | None = None,
     expected_dataset_metadata_sha256: str | None = None,
     expected_target_hz: float | None = None,
+    expected_action_representation: str = _episode_adapter.STATE_DELTA_ACTION_REPRESENTATION,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     value = _read_json(path)
     if value.get("schema_version") != NORM_SCHEMA_VERSION:
@@ -348,9 +350,7 @@ def _load_norm_stats(
         raise ValueError(f"Normalization statistics target_hz does not match dataset: {path}")
     if not isinstance(state, Mapping) or state.get("representation") != "r1pro_compact_state_v1":
         raise ValueError(f"Wrong state normalization representation in {path}")
-    if not isinstance(actions, Mapping) or actions.get("representation") != (
-        _episode_adapter.STATE_DELTA_ACTION_REPRESENTATION
-    ):
+    if not isinstance(actions, Mapping) or actions.get("representation") != expected_action_representation:
         raise ValueError(f"Wrong action normalization representation in {path}")
 
     def pair(entry: Mapping[str, Any], name: str) -> tuple[np.ndarray, np.ndarray]:
@@ -375,6 +375,7 @@ def norm_stats_provenance(path: str | Path) -> dict[str, Any]:
     dataset = value.get("dataset")
     if missing or not isinstance(dataset, Mapping):
         raise ValueError(f"Normalization provenance is incomplete in {resolved}: missing={missing}")
+    actions = value.get("norm_stats", {}).get("actions", {})
     return {
         "path": str(resolved),
         "sha256": _file_sha256(resolved),
@@ -384,6 +385,8 @@ def norm_stats_provenance(path: str | Path) -> dict[str, Any]:
         "train_manifest_sha256": value["train_manifest_sha256"],
         "episode_count": value["episode_count"],
         "dataset": dict(dataset),
+        "action_representation": actions.get("representation"),
+        "hybrid_action_contract": value.get("hybrid_action_contract"),
     }
 
 
@@ -413,6 +416,7 @@ class BehaviorPrecomputed:
         max_trajectories: int | None = None,
         latent_root: str | Path | None = None,
         task_feature_root: str | Path | None = None,
+        hybrid_action_contract_path: str | Path | None = None,
     ) -> None:
         self.root = Path(root).resolve()
         if latent_root is None:
@@ -487,6 +491,19 @@ class BehaviorPrecomputed:
         self.reward_mode = reward_mode
         self.collapse_prob = collapse_prob
         self.manifests = tuple(manifests)
+        self.hybrid_action_contract = (
+            _hybrid_action.load_audited_contract(hybrid_action_contract_path)
+            if hybrid_action_contract_path is not None
+            else None
+        )
+        self.action_representation = (
+            _hybrid_action.HYBRID_REPRESENTATION
+            if self.hybrid_action_contract is not None
+            else _episode_adapter.STATE_DELTA_ACTION_REPRESENTATION
+        )
+        self.hybrid_action_provenance = (
+            self.hybrid_action_contract.provenance() if self.hybrid_action_contract is not None else None
+        )
         self.task_features: _task_cache.LoadedTaskFeatures | None = None
         self.task_feature_provenance: dict[str, Any] | None = None
         if task_feature_root is not None:
@@ -532,6 +549,7 @@ class BehaviorPrecomputed:
                 expected_manifest_sha256=manifest_sha,
                 expected_dataset_metadata_sha256=metadata_hashes.pop(),
                 expected_target_hz=target_rates.pop(),
+                expected_action_representation=self.action_representation,
             )
             self.norm_stats_provenance = norm_stats_provenance(norm_path)
 
@@ -558,7 +576,12 @@ class BehaviorPrecomputed:
         end = t + self.horizon + 1
 
         states = np.array(numeric.states[start:end], dtype=np.float32, copy=True)
-        actions = np.array(numeric.actions[start:end], dtype=np.float32, copy=True)
+        episode_actions = (
+            _hybrid_action.materialize_episode_actions(numeric, self.hybrid_action_contract)
+            if self.hybrid_action_contract is not None
+            else numeric.actions
+        )
+        actions = np.array(episode_actions[start:end], dtype=np.float32, copy=True)
         obs = {
             f"{image_key}_features": np.array(latents[f"{image_key}_features"][start:end], dtype=np.float32, copy=True)
             for image_key in self.image_keys

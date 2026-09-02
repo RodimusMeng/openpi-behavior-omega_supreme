@@ -30,6 +30,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint-mode", choices=("identity", "resume", "b1k_23d_fresh"), required=True)
     parser.add_argument("--dataset-dir", required=True)
     parser.add_argument("--norm-stats-path")
+    parser.add_argument("--hybrid-action-contract", required=True)
     parser.add_argument("--latent-root")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--compliance-manifest")
@@ -153,6 +154,7 @@ def run(
         collapse_prob=0.0,
         max_trajectories=args.max_trajectories,
         latent_root=args.latent_root or dataset_cfg.get("latent_root"),
+        hybrid_action_contract_path=args.hybrid_action_contract,
     )
     _assert_checkpoint_lineage_disjoint(
         base_dataset,

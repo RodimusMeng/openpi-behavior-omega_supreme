@@ -10,6 +10,7 @@ from pathlib import Path
 
 from openpi.weaver import b1k_dataset_adapter as _episode_adapter
 from openpi.weaver import behavior_precomputed
+from openpi.weaver import hybrid_action
 from openpi.weaver import norm_stats
 
 
@@ -20,6 +21,7 @@ class Args:
     max_episodes: int | None = None
     min_std: float = 1e-6
     clamp_small_std: bool = False
+    hybrid_action_contract: str | None = None
 
 
 def _sha256(path: Path) -> str:
@@ -88,6 +90,11 @@ def main(args: Args) -> None:
             )
             yield episode
 
+    hybrid_contract = (
+        hybrid_action.load_audited_contract(args.hybrid_action_contract)
+        if args.hybrid_action_contract is not None
+        else None
+    )
     result = norm_stats.build_norm_stats(
         episodes(),
         dataset_repo_id=repo_ids.pop(),
@@ -96,6 +103,7 @@ def main(args: Args) -> None:
         train_manifest_sha256=_sha256(index_path),
         min_std=args.min_std,
         clamp_small_std=args.clamp_small_std,
+        hybrid_contract=hybrid_contract,
     )
     output_path = (
         Path(args.output_path).expanduser().resolve() if args.output_path is not None else root / "norm_stats.json"

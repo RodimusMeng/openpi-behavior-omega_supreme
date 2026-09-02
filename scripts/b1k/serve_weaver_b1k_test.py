@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
 
+from openpi.weaver import hybrid_action
 from openpi.weaver.causal_action_adapter import require_world_model_horizon
 from scripts.b1k.serve_weaver_b1k import _canonical_prompt_catalog_sha256
 from scripts.b1k.serve_weaver_b1k import _load_norm
@@ -32,21 +34,23 @@ def test_load_norm_requires_exact_train_representations() -> None:
         "norm_stats": {
             "state": {"representation": "r1pro_compact_state_v1", "mean": [0.0] * 23, "std": [1.0] * 23},
             "actions": {
-                "representation": "r1pro_compact_state_delta_v1",
+                "representation": hybrid_action.HYBRID_REPRESENTATION,
                 "mean": [0.0] * 23,
                 "std": [1.0] * 23,
             },
         },
+        "hybrid_action_contract": {"source_audit_sha256": "a" * 64},
     }
+    contract = SimpleNamespace(source_audit_sha256="a" * 64)
     with mock.patch("pathlib.Path.read_text", return_value=json.dumps(payload)):
-        values = _load_norm("norm_stats.json")
+        values = _load_norm("norm_stats.json", expected_hybrid_contract=contract)
     assert all(value.shape == (23,) for value in values)
     payload["source_split"] = "val"
     with (
         mock.patch("pathlib.Path.read_text", return_value=json.dumps(payload)),
         pytest.raises(ValueError, match="train-split"),
     ):
-        _load_norm("norm_stats.json")
+        _load_norm("norm_stats.json", expected_hybrid_contract=contract)
 
 
 def test_horizon_contract_rejects_short_policy_chunks() -> None:
