@@ -170,7 +170,30 @@ def main(argv: Sequence[str] | None = None) -> None:
     }
     output_path = Path(args.output_json).expanduser().resolve()
     _atomic_write_json(output_path, payload)
-    print(json.dumps({key: value for key, value in payload.items() if key != "records"}, indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "output_json": str(output_path),
+                "dataset": payload["dataset"],
+                "evaluation": payload["evaluation"],
+                "fresh_checkpoint": {
+                    "mode": fresh_load.report.mode,
+                    "path": fresh_load.report.checkpoint_path,
+                    "step": fresh_load.report.checkpoint_step,
+                },
+                "trained_checkpoint": {
+                    "mode": trained_load.report.mode,
+                    "path": trained_load.report.checkpoint_path,
+                    "step": trained_load.report.checkpoint_step,
+                },
+                "aggregate": payload["aggregate"],
+                "aggregate_by_batch_slot": payload["aggregate_by_batch_slot"],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 def _evaluation_windows(dataset: BehaviorPrecomputed, *, fraction: float) -> list[dict[str, Any]]:
