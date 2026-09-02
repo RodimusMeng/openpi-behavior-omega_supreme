@@ -143,6 +143,83 @@ def test_atomic_json_report_replaces_complete_document(tmp_path):
     assert not list(tmp_path.glob(".report.json.tmp-*"))
 
 
+def _step_report(step: int, loss: float):
+    return train_script.training_runtime.StepReport(
+        completed_step=step,
+        loss=loss,
+        learning_rate=1e-5,
+        grad_norm=0.5,
+        losses={"flow/Total Loss": loss},
+    )
+
+
+def test_training_metrics_are_atomic_and_record_tiny_overfit_slots(tmp_path):
+    path = tmp_path / "training_metrics.jsonl"
+
+    metadata = train_script._write_training_metrics(
+        path,
+        reports=(_step_report(1, 1.0), _step_report(2, 0.8), _step_report(3, 0.6)),
+        start_step=0,
+        tiny_overfit_batches=2,
+    )
+
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [record["completed_step"] for record in records] == [1, 2, 3]
+    assert [record["batch_slot"] for record in records] == [0, 1, 0]
+    assert [record["run_step"] for record in records] == [1, 2, 3]
+    assert metadata == {
+        "path": str(path),
+        "records_appended": 3,
+        "records_total": 3,
+        "first_recorded_step": 1,
+        "last_recorded_step": 3,
+        "history_complete": True,
+    }
+    assert not list(tmp_path.glob(".training_metrics.jsonl.tmp-*"))
+
+
+def test_training_metrics_resume_appends_and_marks_new_run_slots(tmp_path):
+    path = tmp_path / "training_metrics.jsonl"
+    train_script._write_training_metrics(
+        path,
+        reports=(_step_report(1, 1.0),),
+        start_step=0,
+        tiny_overfit_batches=4,
+    )
+
+    metadata = train_script._write_training_metrics(
+        path,
+        reports=(_step_report(2, 0.9), _step_report(3, 0.7)),
+        start_step=1,
+        tiny_overfit_batches=4,
+    )
+
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [record["completed_step"] for record in records] == [1, 2, 3]
+    assert [record["run_start_step"] for record in records] == [0, 1, 1]
+    assert [record["batch_slot"] for record in records] == [0, 0, 1]
+    assert metadata["records_total"] == 3
+    assert metadata["history_complete"] is True
+
+
+def test_training_metrics_reject_checkpoint_history_mismatch(tmp_path):
+    path = tmp_path / "training_metrics.jsonl"
+    train_script._write_training_metrics(
+        path,
+        reports=(_step_report(1, 1.0),),
+        start_step=0,
+        tiny_overfit_batches=1,
+    )
+
+    with pytest.raises(ValueError, match="metrics end at step 1"):
+        train_script._write_training_metrics(
+            path,
+            reports=(_step_report(3, 0.5),),
+            start_step=2,
+            tiny_overfit_batches=1,
+        )
+
+
 def test_training_lineage_records_exact_episode_semantics():
     class Dataset:
         manifests = (

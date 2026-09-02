@@ -185,6 +185,8 @@ def run(
     # clear the source mapping before model training to avoid a duplicate copy.
     if isinstance(load_result.checkpoint, dict):
         load_result.checkpoint.clear()
+    metrics_path = output_dir / "training_metrics.jsonl"
+    _validate_training_metrics_resume(metrics_path, start_step=start_step)
 
     model = _apply_upstream_wrappers(model, config, torch=torch)
     loop = _loop_config(config, args)
@@ -213,6 +215,12 @@ def run(
         },
         start_step=start_step,
     )
+    metrics = _write_training_metrics(
+        metrics_path,
+        reports=result.reports,
+        start_step=result.start_step,
+        tiny_overfit_batches=args.tiny_overfit_batches,
+    )
     summary = {
         "start_step": result.start_step,
         "completed_step": result.completed_step,
@@ -223,6 +231,7 @@ def run(
         "tiny_overfit_batches": args.tiny_overfit_batches,
         "tiny_overfit_steps": args.tiny_overfit_steps,
         "last_step": dataclasses.asdict(result.reports[-1]) if result.reports else None,
+        "metrics": metrics,
         "telemetry": result.telemetry,
     }
     _atomic_write_json(output_dir / "training_summary.json", summary)
@@ -287,7 +296,7 @@ def _assert_resume_contract(
 def _canonical(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(key): _canonical(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [_canonical(item) for item in value]
     return value
 
@@ -418,6 +427,88 @@ def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _write_training_metrics(
+    path: Path,
+    *,
+    reports: Sequence[training_runtime.StepReport],
+    start_step: int,
+    tiny_overfit_batches: int,
+) -> dict[str, Any]:
+    """Atomically append one invocation's step reports to an auditable JSONL history."""
+
+    existing = _read_training_metrics(path)
+    _validate_training_metrics_resume(path, start_step=start_step, records=existing)
+    appended = []
+    for run_index, report in enumerate(reports):
+        expected_step = start_step + run_index + 1
+        if report.completed_step != expected_step:
+            raise ValueError(
+                f"Training report step {report.completed_step} is not contiguous with start step {start_step}"
+            )
+        appended.append(
+            {
+                **dataclasses.asdict(report),
+                "run_start_step": start_step,
+                "run_step": run_index + 1,
+                "batch_slot": run_index % tiny_overfit_batches if tiny_overfit_batches > 0 else None,
+            }
+        )
+
+    records = [*existing, *appended]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+            for record in records:
+                stream.write(json.dumps(record, sort_keys=True, allow_nan=False))
+                stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {
+        "path": str(path),
+        "records_appended": len(appended),
+        "records_total": len(records),
+        "first_recorded_step": records[0]["completed_step"] if records else None,
+        "last_recorded_step": records[-1]["completed_step"] if records else None,
+        "history_complete": bool(records) and records[0].get("completed_step") == 1,
+    }
+
+
+def _read_training_metrics(path: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    if path.exists():
+        with path.open("r", encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"Invalid training metrics at {path}:{line_number}: {exc}") from exc
+                if not isinstance(value, dict):
+                    raise ValueError(f"Training metrics must contain JSON objects: {path}:{line_number}")
+                records.append(value)
+    return records
+
+
+def _validate_training_metrics_resume(
+    path: Path,
+    *,
+    start_step: int,
+    records: Sequence[Mapping[str, Any]] | None = None,
+) -> None:
+    existing = _read_training_metrics(path) if records is None else records
+    if existing:
+        previous_step = existing[-1].get("completed_step")
+        if previous_step != start_step:
+            raise ValueError(
+                f"Training metrics end at step {previous_step!r}, but resumed checkpoint starts at {start_step}"
+            )
 
 
 def _require_torch() -> Any:
