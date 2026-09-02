@@ -76,6 +76,46 @@ def test_command_state_error_subtracts_current_compact_state_from_every_command(
     np.testing.assert_array_equal(result[1], np.full(23, 3.0))
 
 
+@pytest.mark.parametrize(("count", "phase", "expected"), [(6, 0.0, 0), (6, 0.5, 2), (6, 1.0, 5)])
+def test_phase_index_is_strictly_interval_local(count, phase, expected):
+    assert audit._phase_index(count, phase) == expected
+
+
+def test_frozen_affine_is_fit_only_on_fit_episodes():
+    class Component:
+        name = "all"
+        indices = tuple(range(23))
+
+    class Contract:
+        action_components = (Component(),)
+        action_dim = 23
+
+    rng = np.random.default_rng(7)
+    phase_values = {phase: rng.normal(size=(200, 23)) for phase in audit.PHASES}
+    fit = {"phase_values": phase_values, "targets": 2 * phase_values[0.5] + 3}
+    fitted = audit._fit_component_phase_affine(fit, contract=Contract())
+
+    assert fitted["all"]["phase"] == pytest.approx(0.5)
+    assert fitted["all"]["dimensions"][0]["scale"] == pytest.approx(2.0)
+    assert fitted["all"]["dimensions"][0]["bias"] == pytest.approx(3.0)
+
+
+def test_frozen_prediction_report_does_not_refit_held_out_predictions():
+    class Component:
+        name = "all"
+        indices = (0,)
+
+    class Contract:
+        action_components = (Component(),)
+
+    target = np.arange(10, dtype=np.float64)[:, None]
+    prediction = (2 * target + 3)
+
+    report = audit._frozen_prediction_report(prediction, target, contract=Contract())
+
+    assert report["components"]["all"]["r2"] < 0
+
+
 def test_atomic_audit_refuses_overwrite(tmp_path):
     path = tmp_path / "audit.json"
     audit._atomic_write_json(path, {"complete": True})
