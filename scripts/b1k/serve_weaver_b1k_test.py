@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 from types import SimpleNamespace
 from unittest import mock
@@ -9,11 +10,17 @@ import torch
 
 from openpi.weaver import hybrid_action
 from openpi.weaver.causal_action_adapter import require_world_model_horizon
+from scripts.b1k.serve_weaver_b1k import Args
 from scripts.b1k.serve_weaver_b1k import _canonical_prompt_catalog_sha256
 from scripts.b1k.serve_weaver_b1k import _load_norm
 from scripts.b1k.serve_weaver_b1k import _load_task_prompt_catalog
 from scripts.b1k.serve_weaver_b1k import _resize_batch
 from scripts.b1k.serve_weaver_b1k import _resolve_task
+
+
+def test_server_requires_pinned_task_encoder_model() -> None:
+    field = next(field for field in dataclasses.fields(Args) if field.name == "task_encoder_model")
+    assert field.default is dataclasses.MISSING
 
 
 def test_resize_letterbox_matches_target_shape_and_range() -> None:

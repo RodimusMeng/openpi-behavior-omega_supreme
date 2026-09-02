@@ -169,6 +169,7 @@ class Args:
     policy_dir: str
     weaver_config: str
     weaver_checkpoint: str
+    task_encoder_model: str
     hybrid_action_contract: str
     norm_stats: str
     dataset_dir: str
@@ -430,6 +431,7 @@ def main(args: Args) -> None:
         "policy_dir": args.policy_dir,
         "weaver_config": args.weaver_config,
         "weaver_checkpoint": args.weaver_checkpoint,
+        "task_encoder_model": args.task_encoder_model,
         "hybrid_action_contract": args.hybrid_action_contract,
         "norm_stats": args.norm_stats,
         "dataset_dir": args.dataset_dir,
@@ -451,7 +453,11 @@ def main(args: Args) -> None:
                                                        norm_stats_path=args.norm_stats, dynamics_only=False)
     if args.criterion not in {"reward", "advantage"}:
         raise ValueError("criterion must be 'reward' or 'advantage'")
-    model = upstream_runtime.build_model(config, device=args.device)
+    model = upstream_runtime.build_model(
+        config,
+        device=args.device,
+        task_encoder_model=args.task_encoder_model,
+    )
     upstream_runtime.load_checkpoint_into_model(model, args.weaver_checkpoint,
                                                 mode=args.checkpoint_mode,
                                                 device=args.device)
