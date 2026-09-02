@@ -25,7 +25,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--policy-config", default="pi05_b1k_full")
     parser.add_argument("--expected-action-horizon", type=int, default=32)
-    parser.add_argument("--expected-action-dim", type=int, default=23)
+    parser.add_argument("--expected-model-action-dim", type=int, default=32)
     args = parser.parse_args()
 
     modules = {
@@ -52,8 +52,10 @@ def main() -> None:
         raise ValueError(
             f"Policy action horizon mismatch: expected {args.expected_action_horizon}, got {actual_horizon}"
         )
-    if actual_dim != args.expected_action_dim:
-        raise ValueError(f"Policy action dimension mismatch: expected {args.expected_action_dim}, got {actual_dim}")
+    if actual_dim != args.expected_model_action_dim:
+        raise ValueError(
+            f"Policy model action dimension mismatch: expected {args.expected_model_action_dim}, got {actual_dim}"
+        )
 
     report = {
         "schema_version": "openpi_weaver_combined_runtime_v1",
@@ -66,7 +68,8 @@ def main() -> None:
         "policy": {
             "config": policy_cfg.name,
             "action_horizon": actual_horizon,
-            "action_dim": actual_dim,
+            "model_action_dim": actual_dim,
+            "post_transform_b1k_action_dim": 23,
         },
     }
     print(json.dumps(report, indent=2, sort_keys=True))
