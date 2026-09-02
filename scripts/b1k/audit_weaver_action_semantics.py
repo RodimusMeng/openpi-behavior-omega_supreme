@@ -17,7 +17,7 @@ from openpi.weaver import causal_action_adapter
 from openpi.weaver.b1k_contract import build_r1pro_contract
 from openpi.weaver.behavior_precomputed import load_numeric_episode
 
-SCHEMA_VERSION = "b1k_weaver_action_semantics_audit_v1"
+SCHEMA_VERSION = "b1k_weaver_action_semantics_audit_v2"
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -58,11 +58,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             "openpi_start",
             "openpi_end",
             "openpi_duration_mean",
+            "command_state_error_start",
+            "command_state_error_end",
+            "command_state_error_duration_mean",
         )
     }
     lag_predictors = {
         representation: {lag: [] for lag in lags}
-        for representation in ("raw_point", "openpi_point")
+        for representation in ("raw_point", "openpi_point", "command_state_error_point")
     }
     lag_targets = {lag: [] for lag in lags}
     targets = []
@@ -92,6 +95,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             current_state = np.asarray(numeric.states[interval_index], dtype=np.float64)
             target = np.asarray(numeric.actions[interval_index], dtype=np.float64)
             openpi = contract.environment_to_openpi_training_actions(raw, current_state)
+            command_state_error = _command_minus_current_state(raw, current_state)
             duration_weight = durations / durations.sum()
 
             values = {
@@ -101,6 +105,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "openpi_start": openpi[0],
                 "openpi_end": openpi[-1],
                 "openpi_duration_mean": np.sum(openpi * duration_weight[:, None], axis=0),
+                "command_state_error_start": command_state_error[0],
+                "command_state_error_end": command_state_error[-1],
+                "command_state_error_duration_mean": np.sum(
+                    command_state_error * duration_weight[:, None], axis=0
+                ),
             }
             targets.append(target)
             for name, value in values.items():
@@ -122,9 +131,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                     continue
                 raw_point = np.asarray(numeric.source_policy_actions[source_index], dtype=np.float64)
                 openpi_point = contract.environment_to_openpi_training_actions(raw_point[None], current_state)[0]
+                command_state_error_point = _command_minus_current_state(raw_point[None], current_state)[0]
                 lag_targets[lag].append(target)
                 lag_predictors["raw_point"][lag].append(raw_point)
                 lag_predictors["openpi_point"][lag].append(openpi_point)
+                lag_predictors["command_state_error_point"][lag].append(command_state_error_point)
 
     target_array = np.stack(targets)
     dimension_labels = _dimension_labels(contract)
@@ -202,6 +213,16 @@ def _dimension_labels(contract: Any) -> list[dict[str, Any]]:
         }
         for index in range(contract.action_dim)
     ]
+
+
+def _command_minus_current_state(commands: np.ndarray, current_state: np.ndarray) -> np.ndarray:
+    actions = np.asarray(commands, dtype=np.float64)
+    state = np.asarray(current_state, dtype=np.float64)
+    if actions.ndim != 2 or actions.shape[1] != 23 or state.shape != (23,):
+        raise ValueError("command-state error requires commands (S,23) and current_state (23,)")
+    if not np.isfinite(actions).all() or not np.isfinite(state).all():
+        raise ValueError("command-state error inputs must be finite")
+    return actions - state[None]
 
 
 def _dimension_metrics(predictor: np.ndarray, target: np.ndarray) -> dict[str, Any]:

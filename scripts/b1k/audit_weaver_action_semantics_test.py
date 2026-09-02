@@ -66,6 +66,16 @@ def test_best_lag_prefers_highest_component_r2_then_smallest_absolute_lag():
     assert lag == 0
 
 
+def test_command_state_error_subtracts_current_compact_state_from_every_command():
+    commands = np.stack([np.arange(23), np.arange(23) + 2.0])
+    current = np.arange(23) - 1.0
+
+    result = audit._command_minus_current_state(commands, current)
+
+    np.testing.assert_array_equal(result[0], np.ones(23))
+    np.testing.assert_array_equal(result[1], np.full(23, 3.0))
+
+
 def test_atomic_audit_refuses_overwrite(tmp_path):
     path = tmp_path / "audit.json"
     audit._atomic_write_json(path, {"complete": True})
