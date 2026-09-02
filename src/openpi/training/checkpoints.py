@@ -9,6 +9,7 @@ from typing import List, Protocol
 from etils import epath
 import jax
 import orbax.checkpoint as ocp
+from orbax.checkpoint import checkpoint_utils
 import orbax.checkpoint.future as future
 
 from openpi.shared import array_typing as at
@@ -91,6 +92,7 @@ def restore_state(
     checkpoint_manager: ocp.CheckpointManager,
     state: training_utils.TrainState,
     data_loader: _data_loader.DataLoader,
+    state_sharding=None,
     step: int | None = None,
 ) -> training_utils.TrainState:
     del data_loader
@@ -98,13 +100,41 @@ def restore_state(
     with at.disable_typechecking():
         # Split params that can be used for inference into a separate item.
         train_state, params = _split_params(state)
-        restored = checkpoint_manager.restore(
-            step,
-            items={
-                "train_state": train_state,
-                "params": {"params": params},
-            },
-        )
+        items = {
+            "train_state": train_state,
+            "params": {"params": params},
+        }
+
+        # When restoring on a different device topology, Orbax must be given
+        # the target shardings explicitly. Otherwise it attempts to reuse the
+        # sharding metadata stored in the checkpoint, which is unsafe when,
+        # for example, restoring an 8-GPU checkpoint on 4 GPUs.
+        if state_sharding is None:
+            restored = checkpoint_manager.restore(step, items=items)
+        else:
+            train_state_sharding, params_sharding = _split_params(state_sharding)
+
+            restore_kwargs = {
+                "train_state": {
+                    "restore_args": checkpoint_utils.construct_restore_args(
+                        train_state,
+                        train_state_sharding,
+                    ),
+                },
+                "params": {
+                    "restore_args": checkpoint_utils.construct_restore_args(
+                        {"params": params},
+                        {"params": params_sharding},
+                    ),
+                },
+            }
+
+            restored = checkpoint_manager.restore(
+                step,
+                items=items,
+                restore_kwargs=restore_kwargs,
+            )
+
     return _merge_params(restored["train_state"], restored["params"])
 
 
