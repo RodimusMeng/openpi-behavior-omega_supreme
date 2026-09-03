@@ -187,7 +187,14 @@ def interval_action(
     for index in gripper_indices():
         value = float(grip_command[index])
         if not (np.isclose(value, -1.0, atol=1e-5) or np.isclose(value, 1.0, atol=1e-5)):
-            raise ValueError(f"Gripper command at index {index} is not binary -1/+1: {value}")
+            if abs(value - 1.0) <= 0.10:
+                value = 1.0
+            elif abs(value + 1.0) <= 0.10:
+                value = -1.0
+            else:
+                raise ValueError(
+                    f"Gripper command at index {index} is not close to binary -1/+1: {value}"
+                )
         result[index] = -1.0 if value < 0 else 1.0
     return result
 
