@@ -50,7 +50,9 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-OPENPI_ROOT="${OPENPI_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_OPENPI_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+OPENPI_ROOT="${OPENPI_ROOT:-$DEFAULT_OPENPI_ROOT}"
 DATASET_ROOT="${DATASET_ROOT:-/inspire/dataset/behavior-1k-2026-challenge-demos/v3again}"
 WEAVER_WORK_ROOT="${WEAVER_WORK_ROOT:-/tmp/weaver-benchmark}"
 BENCH_MODE="${BENCH_MODE:-dry-run}"
@@ -163,19 +165,47 @@ mkdir -p "$LOG_DIR"
 LOG_PATH="$LOG_DIR/prepare-${BENCH_MODE}-$(date +%Y%m%d-%H%M%S)-$$.log"
 TELEMETRY_PATH="${LOG_PATH%.log}.telemetry.log"
 
-read -r -a EPISODES <<< "$BENCH_EPISODES"
+mapfile -t EPISODES < <(
+  printf '%s\n' "$BENCH_EPISODES" |
+    tr '[:space:]' '\n' |
+    sed '/^$/d'
+)
 if (( ${#EPISODES[@]} == 0 )); then
   echo "BENCH_EPISODES must contain at least one episode index" >&2
   exit 2
 fi
+for episode in "${EPISODES[@]}"; do
+  if ! [[ "$episode" =~ ^[0-9]+$ ]]; then
+    echo "BENCH_EPISODES contains a non-integer token: $episode" >&2
+    exit 2
+  fi
+done
 
 prepare_script="scripts/b1k/prepare_weaver_dataset.py"
 if [[ "$BENCH_RUNTIME" == "parallel" ]]; then
   prepare_script="scripts/b1k/prepare_weaver_dataset_parallel.py"
 fi
 
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+  if [[ -n "${VIRTUAL_ENV:-}" && -x "$VIRTUAL_ENV/bin/python" ]]; then
+    PYTHON_BIN="$VIRTUAL_ENV/bin/python"
+  else
+    PYTHON_BIN="$(command -v python || true)"
+  fi
+else
+  resolved_python="$(command -v "$PYTHON_BIN" 2>/dev/null || true)"
+  if [[ -n "$resolved_python" ]]; then
+    PYTHON_BIN="$resolved_python"
+  fi
+fi
+
+if [[ -z "${PYTHON_BIN:-}" || ! -x "$PYTHON_BIN" ]]; then
+  echo "Could not resolve a usable Python interpreter: ${PYTHON_BIN:-unset}" >&2
+  exit 2
+fi
+
 cmd=(
-  uv run python "$prepare_script"
+  "$PYTHON_BIN" "$prepare_script"
   --config-name pi05_b1k_full
   --dataset-root "$DATASET_ROOT"
   --output-dir "$BENCH_OUT"
@@ -206,6 +236,7 @@ if [[ -n "${CPUSET:-}" ]]; then
   run_cmd=(taskset -c "$CPUSET" "${run_cmd[@]}")
 fi
 
+export PYTHONPATH="$OPENPI_ROOT/src:$OPENPI_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONUNBUFFERED=1
 if [[ -n "${THREADS:-}" ]]; then
   if ! [[ "$THREADS" =~ ^[1-9][0-9]*$ ]]; then
