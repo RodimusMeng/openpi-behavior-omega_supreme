@@ -611,6 +611,12 @@ class TrainConfig:
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
 
+    # PyTorch DataLoader tuning. These fields are part of the frozen broad
+    # absolute-action B1K recipe, even though policy serving does not construct
+    # a training loader.
+    prefetch_factor: int | None = None
+    persistent_workers: bool = True
+
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
     # If true, will resume training from the last checkpoint.
@@ -773,6 +779,67 @@ _CONFIGS = [
         ),
         save_interval=10_000,
         num_train_steps=50_000,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir=(
+            "/inspire/hdd/project/robot-reasoning/"
+            "xiangyushun-p-xiangyushun/"
+            "2026_behavior_challenge/tiancheng/checkpoints"
+        ),
+    ),
+    # Frozen broad RGB + absolute-controller-action checkpoint recipe. Keep
+    # this available on the WEAVER branch because the online selector must
+    # construct the policy with the exact inference transforms used to train
+    # the borrowed baseline checkpoint. In particular, it must not apply the
+    # default B1K delta/absolute transform pair.
+    TrainConfig(
+        name="pi05_b1k_full_abs",
+        model=pi0_config.Pi0Config(
+            action_horizon=32,
+            pi05=True,
+        ),
+        data=LeRobotB1KDataConfig(
+            repo_id="b1k-v3again",
+            base_config=DataConfig(
+                data_cls=_lerobot_compat.LeRobotDataset,
+                dataset_root=(
+                    "/inspire/dataset/"
+                    "behavior-1k-2026-challenge-demos/v3again"
+                ),
+                prompt_from_task=True,
+                dataset_kwargs={
+                    "tolerance_s": 5e-4,
+                    "video_backend": "pyav",
+                },
+            ),
+            robot_config_name="b1k/R1Pro",
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        batch_size=128,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-6,
+            decay_steps=100_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(
+            b1=0.9,
+            b2=0.95,
+            eps=1e-8,
+            weight_decay=1e-10,
+            clip_gradient_norm=1.0,
+        ),
+        ema_decay=0.99,
+        seed=42,
+        num_workers=32,
+        prefetch_factor=2,
+        persistent_workers=True,
+        fsdp_devices=8,
+        num_train_steps=100_000,
+        save_interval=10_000,
+        keep_period=20_000,
         assets_base_dir="./outputs/assets",
         checkpoint_base_dir=(
             "/inspire/hdd/project/robot-reasoning/"

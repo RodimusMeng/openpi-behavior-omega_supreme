@@ -8,6 +8,7 @@ from unittest import mock
 import pytest
 import torch
 
+from openpi.training import config as training_config
 from openpi.weaver import hybrid_action
 from openpi.weaver.causal_action_adapter import require_world_model_horizon
 from scripts.b1k.serve_weaver_b1k import Args
@@ -21,6 +22,14 @@ from scripts.b1k.serve_weaver_b1k import _resolve_task
 def test_server_requires_pinned_task_encoder_model() -> None:
     field = next(field for field in dataclasses.fields(Args) if field.name == "task_encoder_model")
     assert field.default is dataclasses.MISSING
+
+
+def test_broad_absolute_checkpoint_config_keeps_controller_actions_absolute() -> None:
+    cfg = training_config.get_config("pi05_b1k_full_abs")
+    assert cfg.model.action_horizon == 32
+    assert cfg.model.action_dim == 32
+    assert cfg.data.robot_config_name == "b1k/R1Pro"
+    assert cfg.data.extra_delta_transform is False
 
 
 def test_resize_letterbox_matches_target_shape_and_range() -> None:

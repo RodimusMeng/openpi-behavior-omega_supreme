@@ -23,7 +23,7 @@ def _version(module: Any) -> str | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--policy-config", default="pi05_b1k_full")
+    parser.add_argument("--policy-config", default="pi05_b1k_full_abs")
     parser.add_argument("--expected-action-horizon", type=int, default=32)
     parser.add_argument("--expected-model-action-dim", type=int, default=32)
     args = parser.parse_args()
@@ -48,6 +48,7 @@ def main() -> None:
     policy_cfg = config.get_config(args.policy_config)
     actual_horizon = int(policy_cfg.model.action_horizon)
     actual_dim = int(policy_cfg.model.action_dim)
+    extra_delta_transform = getattr(policy_cfg.data, "extra_delta_transform", None)
     if actual_horizon != args.expected_action_horizon:
         raise ValueError(
             f"Policy action horizon mismatch: expected {args.expected_action_horizon}, got {actual_horizon}"
@@ -55,6 +56,11 @@ def main() -> None:
     if actual_dim != args.expected_model_action_dim:
         raise ValueError(
             f"Policy model action dimension mismatch: expected {args.expected_model_action_dim}, got {actual_dim}"
+        )
+    if extra_delta_transform is not False:
+        raise ValueError(
+            "Borrowed broad B1K checkpoint requires an absolute-action policy config "
+            f"with extra_delta_transform=False, got {extra_delta_transform!r}"
         )
 
     report = {
@@ -70,6 +76,7 @@ def main() -> None:
             "action_horizon": actual_horizon,
             "model_action_dim": actual_dim,
             "post_transform_b1k_action_dim": 23,
+            "extra_delta_transform": extra_delta_transform,
         },
     }
     print(json.dumps(report, indent=2, sort_keys=True))
