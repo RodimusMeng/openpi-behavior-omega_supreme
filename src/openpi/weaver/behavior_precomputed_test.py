@@ -447,3 +447,41 @@ def test_short_episodes_are_excluded_before_sampling(tmp_path):
     )
     assert len(dataset) == 1
     assert dataset.manifests[0]["episode_index"] == 1
+
+
+def test_explicit_episode_selection_preserves_requested_order_and_fails_closed(tmp_path):
+    manifests = [
+        _write_episode(tmp_path, _episode(3)),
+        _write_episode(tmp_path, _episode(7)),
+        _write_episode(tmp_path, _episode(11)),
+    ]
+    _write_index(tmp_path, manifests)
+
+    dataset = behavior_precomputed.BehaviorPrecomputed(
+        tmp_path,
+        horizon=3,
+        n_history=2,
+        normalize=False,
+        reward_mode="disabled",
+        episode_indices=(11, 3),
+    )
+
+    assert [manifest["episode_index"] for manifest in dataset.manifests] == [11, 3]
+    with pytest.raises(ValueError, match="absent from split"):
+        behavior_precomputed.BehaviorPrecomputed(
+            tmp_path,
+            horizon=3,
+            n_history=2,
+            normalize=False,
+            reward_mode="disabled",
+            episode_indices=(99,),
+        )
+    with pytest.raises(ValueError, match="duplicates"):
+        behavior_precomputed.BehaviorPrecomputed(
+            tmp_path,
+            horizon=3,
+            n_history=2,
+            normalize=False,
+            reward_mode="disabled",
+            episode_indices=(3, 3),
+        )

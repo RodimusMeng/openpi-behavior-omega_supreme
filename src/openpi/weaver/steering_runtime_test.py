@@ -111,3 +111,56 @@ def test_imagine_and_score_batches_one_pool_and_rejects_mismatched_adapter():
             gamma=0.995,
             use_autocast=False,
         )
+
+
+class _StochasticFakeModel(_FakeModel):
+    def generate_latent_rollouts_variable_horizon(
+        self, *, context, future_actions, future_states, history_actions, memory_tokens
+    ):
+        del future_states, history_actions, memory_tokens
+        batch_size = future_actions.shape[0]
+        state_history = context["states"].expand(batch_size, -1, -1)
+        future = future_actions + torch.randn_like(future_actions)
+        camera_history = context["camera"].expand(batch_size, -1, -1, -1)
+        return {
+            "camera": torch.cat([camera_history, future[..., :1, None]], dim=1),
+            "states": torch.cat([state_history, future], dim=1),
+        }
+
+    def rm(self, imagined, actions, task_embed):
+        del actions, task_embed
+        return imagined["states"].mean(dim=-1)
+
+
+def test_rollout_seed_replays_stochastic_imagination_without_leaking_rng_state():
+    pool = CandidatePool(np.ones((2, 3, 23), dtype=np.float32), "0" * 64)
+    context = {"camera": torch.zeros(1, 2, 1, 1), "states": torch.zeros(1, 2, 23)}
+    kwargs = {
+        "model": _StochasticFakeModel(),
+        "context": context,
+        "history_actions": torch.zeros(1, 2, 23),
+        "adapted_actions": _adapted(pool),
+        "task": {"text": "task"},
+        "n_history": 2,
+        "candidate_pool": pool,
+        "device": "cpu",
+        "gamma": 0.995,
+        "criterion": "reward",
+        "use_autocast": False,
+    }
+    torch.manual_seed(99)
+    expected_next = torch.randn(4)
+    torch.manual_seed(99)
+    first = imagine_and_score(**kwargs, rollout_seed=123)
+    actual_next = torch.randn(4)
+    second = imagine_and_score(**kwargs, rollout_seed=123)
+    different = imagine_and_score(**kwargs, rollout_seed=456)
+
+    np.testing.assert_array_equal(first.scores, second.scores)
+    assert first.rollout_diagnostics["states"]["future_sha256"] == second.rollout_diagnostics["states"]["future_sha256"]
+    assert (
+        first.rollout_diagnostics["states"]["future_sha256"] != different.rollout_diagnostics["states"]["future_sha256"]
+    )
+    torch.testing.assert_close(actual_next, expected_next)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        imagine_and_score(**kwargs, rollout_seed=-1)

@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 import dataclasses
+import hashlib
 import math
 from typing import Any, Literal
 
@@ -67,7 +68,7 @@ class ScoredCandidatePool:
             for key, value in diagnostics.items():
                 shape = value.get("shape")
                 future_shape = value.get("future_shape")
-                if not isinstance(shape, (list, tuple)) or not isinstance(future_shape, (list, tuple)):
+                if not isinstance(shape, list | tuple) or not isinstance(future_shape, list | tuple):
                     raise ValueError(f"rollout diagnostic {key!r} must contain shape and future_shape")
                 if not shape or not future_shape or int(shape[0]) != rewards.shape[0]:
                     raise ValueError(f"rollout diagnostic {key!r} has the wrong candidate axis")
@@ -142,6 +143,7 @@ def imagine_and_score(
     future_state_placeholder: Any | None = None,
     oracle_scores: Sequence[float] | None = None,
     use_autocast: bool = True,
+    rollout_seed: int | None = None,
 ) -> ScoredCandidatePool:
     """Run one batched upstream rollout for an immutable candidate pool."""
 
@@ -200,7 +202,10 @@ def imagine_and_score(
         if use_autocast and str(device).startswith("cuda")
         else nullcontext()
     )
-    with torch.no_grad(), autocast:
+    rng_context = _fork_rng(torch, device=device, seed=rollout_seed)
+    with rng_context, torch.no_grad(), autocast:
+        if rollout_seed is not None:
+            torch.manual_seed(rollout_seed)
         imagined = model.generate_latent_rollouts_variable_horizon(
             context=context_batch,
             future_actions=actions,
@@ -261,12 +266,27 @@ def _summarize_rollout(
             "finite": bool(torch.isfinite(future).all().item()),
             "future_min": float(future.min().cpu()),
             "future_max": float(future.max().cpu()),
+            "future_mean": float(future.mean().cpu()),
+            "future_rms": float(torch.sqrt(torch.mean(torch.square(future))).cpu()),
+            "future_sha256": hashlib.sha256(future.cpu().numpy().tobytes()).hexdigest(),
             "candidate_pairwise_rms_min": pairwise_min,
             "candidate_pairwise_rms_max": pairwise_max,
         }
     if not result:
         raise ValueError("WEAVER returned an empty imagined rollout")
     return result
+
+
+def _fork_rng(torch: Any, *, device: str, seed: int | None) -> Any:
+    if seed is None:
+        return nullcontext()
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("rollout_seed must be a non-negative integer")
+    target = torch.device(device)
+    devices: list[int] = []
+    if target.type == "cuda":
+        devices = [torch.cuda.current_device() if target.index is None else target.index]
+    return torch.random.fork_rng(devices=devices)
 
 
 def _expand_candidate(value: Any, batch_size: int, *, torch: Any, device: str) -> Any:

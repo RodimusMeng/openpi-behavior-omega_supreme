@@ -39,6 +39,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--split", choices=("train",), default="train")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--episode-indices", type=int, nargs="+")
     parser.add_argument("--max-trajectories", type=int)
     parser.add_argument("--tiny-overfit-batches", type=int, default=0)
     parser.add_argument("--tiny-overfit-steps", type=int)
@@ -109,6 +110,7 @@ def run(
         norm_stats_path=dataset_cfg.get("norm_stats_path"),
         reward_mode="required" if args.mode == "full" else "disabled",
         collapse_prob=float(dataset_cfg.get("collapse_prob", 0.0)),
+        episode_indices=None if args.episode_indices is None else tuple(args.episode_indices),
         max_trajectories=args.max_trajectories,
         latent_root=dataset_cfg.get("latent_root"),
         hybrid_action_contract_path=args.hybrid_action_contract,
@@ -168,9 +170,7 @@ def run(
         device=args.device,
     )
     if bool(load_result.resumed) != bool(args.resume):
-        raise ValueError(
-            f"Checkpoint loader resumed={load_result.resumed!r} disagrees with --resume={args.resume!r}"
-        )
+        raise ValueError(f"Checkpoint loader resumed={load_result.resumed!r} disagrees with --resume={args.resume!r}")
 
     optimizer = training_runtime.build_optimizer(
         model,
@@ -404,8 +404,7 @@ def _validate_mode_config(config: Mapping[str, Any], *, mode: str) -> None:
     expected_reward_mode = "required" if mode == "full" else "disabled"
     if dataset.get("reward_mode") != expected_reward_mode:
         raise ValueError(
-            f"{mode} mode requires dataset.reward_mode={expected_reward_mode!r}, "
-            f"got {dataset.get('reward_mode')!r}"
+            f"{mode} mode requires dataset.reward_mode={expected_reward_mode!r}, got {dataset.get('reward_mode')!r}"
         )
     if bool(training.get("dynamics_only")) != (mode == "dynamics"):
         raise ValueError("training.dynamics_only must agree with the selected adapter mode")

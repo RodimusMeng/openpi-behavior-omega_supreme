@@ -28,6 +28,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint-config", required=True)
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--checkpoint-mode", choices=("identity", "resume", "b1k_23d_fresh"), required=True)
+    parser.add_argument("--task-encoder-model", required=True)
     parser.add_argument("--dataset-dir", required=True)
     parser.add_argument("--norm-stats-path")
     parser.add_argument("--hybrid-action-contract", required=True)
@@ -42,6 +43,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--window-stride", type=int, default=1)
     parser.add_argument("--max-windows", type=int)
     parser.add_argument("--max-trajectories", type=int)
+    parser.add_argument("--episode-indices", type=int, nargs="+")
     parser.add_argument(
         "--horizon",
         type=int,
@@ -50,7 +52,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Repeat for short/long-horizon evaluation; defaults to checkpoint eval_horizon/horizon",
     )
     parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--reward-critic", action="store_true", help="Also evaluate frozen RM/critic on held-out labels")
+    parser.add_argument(
+        "--reward-critic", action="store_true", help="Also evaluate frozen RM/critic on held-out labels"
+    )
     parser.add_argument("--decode-rgb", action="store_true")
     parser.add_argument("--decode-chunk-size", type=int, default=16)
     parser.add_argument("--lpips", action="store_true", help="Compute real LPIPS; requires the optional lpips package")
@@ -152,6 +156,7 @@ def run(
         norm_stats_path=dataset_cfg.get("norm_stats_path"),
         reward_mode="required" if args.reward_critic else "disabled",
         collapse_prob=0.0,
+        episode_indices=None if args.episode_indices is None else tuple(args.episode_indices),
         max_trajectories=args.max_trajectories,
         latent_root=args.latent_root or dataset_cfg.get("latent_root"),
         hybrid_action_contract_path=args.hybrid_action_contract,
@@ -162,6 +167,11 @@ def run(
         checkpoint_mode=args.checkpoint_mode,
     )
     _assert_checkpoint_norm_provenance(
+        base_dataset,
+        checkpoint_dir=Path(args.checkpoint_dir).expanduser().resolve(),
+        checkpoint_mode=args.checkpoint_mode,
+    )
+    _assert_checkpoint_hybrid_provenance(
         base_dataset,
         checkpoint_dir=Path(args.checkpoint_dir).expanduser().resolve(),
         checkpoint_mode=args.checkpoint_mode,
@@ -183,7 +193,7 @@ def run(
         **worker_kwargs,
     )
 
-    model = build_model(config, device=args.device)
+    model = build_model(config, device=args.device, task_encoder_model=args.task_encoder_model)
     load_result = load_checkpoint_into_model(
         model,
         Path(args.checkpoint_dir).expanduser().resolve(),
@@ -216,7 +226,9 @@ def run(
             record_sink=writer,
             lpips_metric=lpips_metric,
         )
-    head_metrics = _evaluate_reward_critic(loader, model, args=args, config=config, torch=torch) if args.reward_critic else None
+    head_metrics = (
+        _evaluate_reward_critic(loader, model, args=args, config=config, torch=torch) if args.reward_critic else None
+    )
     cuda_telemetry = telemetry.finish()
     summary = {
         **metric_summary,
@@ -238,6 +250,7 @@ def run(
             "window_stride": args.window_stride,
             "max_windows": args.max_windows,
             "max_trajectories": args.max_trajectories,
+            "episode_indices": [int(manifest["episode_index"]) for manifest in base_dataset.manifests],
             "seed": args.seed,
             "val_steps": int(config["model"]["val_steps"]),
             "effective_nfe": _effective_nfe(config, horizon=max(horizons)),
@@ -303,6 +316,13 @@ def _validate_runtime_args(args: argparse.Namespace) -> None:
         value = getattr(args, name)
         if value is not None:
             _positive_int(value, name=name)
+    if args.episode_indices is not None:
+        if not args.episode_indices or any(value < 0 for value in args.episode_indices):
+            raise ValueError("episode_indices must contain non-negative IDs")
+        if len(set(args.episode_indices)) != len(args.episode_indices):
+            raise ValueError("episode_indices must not contain duplicates")
+        if args.max_trajectories is not None:
+            raise ValueError("Use either --episode-indices or --max-trajectories, not both")
     if (
         isinstance(args.decode_chunk_size, bool)
         or not isinstance(args.decode_chunk_size, int)
@@ -520,6 +540,42 @@ def _canonical_norm_provenance(value: Any) -> Any:
     if not isinstance(value, Mapping):
         return None
     normalized = {str(key): item for key, item in value.items() if key != "path"}
+    return json.loads(json.dumps(normalized, sort_keys=True, allow_nan=False))
+
+
+def _assert_checkpoint_hybrid_provenance(
+    dataset: Any,
+    *,
+    checkpoint_dir: Path,
+    checkpoint_mode: str,
+) -> None:
+    """Prove evaluation uses the hybrid action contract saved by training."""
+
+    config_path = checkpoint_dir / "config.yaml"
+    if not config_path.is_file():
+        if checkpoint_mode != "b1k_23d_fresh":
+            raise ValueError("Trained checkpoint has no saved config for hybrid action provenance")
+        return
+    try:
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise ValueError(f"Could not read checkpoint config {config_path}: {exc}") from exc
+    if not isinstance(saved, Mapping):
+        raise ValueError(f"Checkpoint config must contain a mapping: {config_path}")
+    expected = saved.get("weaver_hybrid_action_provenance")
+    if expected is None:
+        if checkpoint_mode != "b1k_23d_fresh":
+            raise ValueError("Trained checkpoint has no hybrid action provenance")
+        return
+    actual = getattr(dataset, "hybrid_action_provenance", None)
+    if _canonical_hybrid_provenance(expected) != _canonical_hybrid_provenance(actual):
+        raise ValueError("Held-out hybrid action contract differs from checkpoint training provenance")
+
+
+def _canonical_hybrid_provenance(value: Any) -> Any:
+    if not isinstance(value, Mapping):
+        return None
+    normalized = {str(key): item for key, item in value.items() if key != "source_audit_path"}
     return json.loads(json.dumps(normalized, sort_keys=True, allow_nan=False))
 
 

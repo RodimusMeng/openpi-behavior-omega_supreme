@@ -63,6 +63,8 @@ def _args(tmp_path: Path, *extra: str):
             str(tmp_path / "checkpoint"),
             "--checkpoint-mode",
             "identity",
+            "--task-encoder-model",
+            str(tmp_path / "clip"),
             "--dataset-dir",
             str(tmp_path / "dataset"),
             "--hybrid-action-contract",
@@ -171,6 +173,33 @@ def test_norm_provenance_is_required_and_must_match_for_trained_checkpoint(tmp_p
         )
 
 
+def test_hybrid_provenance_is_required_and_must_match_for_trained_checkpoint(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "weaver_hybrid_action_provenance": {
+                    "source_audit_sha256": "a" * 64,
+                    "source_audit_path": "/train/audit.json",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class _Dataset:
+        hybrid_action_provenance: ClassVar = {
+            "source_audit_sha256": "b" * 64,
+            "source_audit_path": "/eval/audit.json",
+        }
+
+    with pytest.raises(ValueError, match="hybrid action contract differs"):
+        eval_weaver_b1k._assert_checkpoint_hybrid_provenance(
+            _Dataset(), checkpoint_dir=checkpoint_dir, checkpoint_mode="resume"
+        )
+
+
 def test_checkpoint_mode_must_be_explicit(tmp_path: Path) -> None:
     config = _checkpoint_config(tmp_path / "config.yaml")
     with pytest.raises(SystemExit):
@@ -180,6 +209,8 @@ def test_checkpoint_mode_must_be_explicit(tmp_path: Path) -> None:
                 str(config),
                 "--checkpoint-dir",
                 str(tmp_path / "checkpoint"),
+                "--task-encoder-model",
+                str(tmp_path / "clip"),
                 "--dataset-dir",
                 str(tmp_path / "dataset"),
                 "--output-dir",

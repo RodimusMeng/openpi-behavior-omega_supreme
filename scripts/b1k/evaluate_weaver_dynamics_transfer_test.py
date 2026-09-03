@@ -63,12 +63,14 @@ def test_aggregate_by_batch_slot_keeps_episode_comparisons_separate():
 def test_data_contract_accepts_relocated_norm_path_and_rejects_semantic_drift():
     class Dataset:
         def __init__(self):
+            self.split = "train"
             self.manifests = ({"episode_index": 7, "semantic_sha256": "a" * 64},)
             self.norm_stats_provenance = {
                 "path": "/new/norm.json",
                 "sha256": "b" * 64,
                 "schema_version": "b1k_weaver_norm_v1",
             }
+            self.hybrid_action_provenance = {"schema_version": "hybrid-v1", "source_audit_path": "/new/audit.json"}
 
     config = {
         "weaver_lineage": {
@@ -82,11 +84,46 @@ def test_data_contract_accepts_relocated_norm_path_and_rejects_semantic_drift():
             "sha256": "b" * 64,
             "schema_version": "b1k_weaver_norm_v1",
         },
+        "weaver_hybrid_action_provenance": {
+            "schema_version": "hybrid-v1",
+            "source_audit_path": "/old/audit.json",
+        },
     }
 
-    evaluation._validate_data_contract(config, Dataset())
-    config["weaver_lineage"]["episode_indices"] = [8]
-    with pytest.raises(ValueError, match="lineage"):
+    assert evaluation._validate_data_contract(config, Dataset()) == "in_sample"
+    config["weaver_lineage"]["semantic_sha256"] = ["d" * 64]
+    with pytest.raises(ValueError, match="overlaps"):
+        evaluation._validate_data_contract(config, Dataset())
+
+
+def test_data_contract_accepts_disjoint_held_out_split_and_rejects_hybrid_drift():
+    class Dataset:
+        def __init__(self):
+            self.split = "val"
+            self.manifests = ({"episode_index": 21, "semantic_sha256": "c" * 64},)
+            self.norm_stats_provenance = {"path": "/new/norm.json", "sha256": "b" * 64}
+            self.hybrid_action_provenance = {
+                "schema_version": "hybrid-v1",
+                "source_audit_path": "/new/audit.json",
+            }
+
+    config = {
+        "weaver_lineage": {
+            "split": "train",
+            "episode_count": 1,
+            "episode_indices": [7],
+            "semantic_sha256": ["a" * 64],
+        },
+        "weaver_norm_provenance": {"path": "/old/norm.json", "sha256": "b" * 64},
+        "weaver_hybrid_action_provenance": {
+            "schema_version": "hybrid-v1",
+            "source_audit_path": "/old/audit.json",
+        },
+    }
+
+    assert evaluation._validate_data_contract(config, Dataset()) == "held_out_episode"
+    config["weaver_hybrid_action_provenance"]["schema_version"] = "wrong"
+    with pytest.raises(ValueError, match="hybrid action contract"):
         evaluation._validate_data_contract(config, Dataset())
 
 
@@ -115,6 +152,8 @@ def test_parse_args_requires_two_checkpoint_roots_and_output():
             "dataset",
             "--norm-stats-path",
             "norm.json",
+            "--hybrid-action-contract",
+            "hybrid.json",
             "--output-json",
             "result.json",
         ]
@@ -122,4 +161,5 @@ def test_parse_args_requires_two_checkpoint_roots_and_output():
 
     assert args.fresh_device == "cuda:0"
     assert args.trained_device == "cuda:1"
+    assert args.evaluation_split == "train"
     assert args.noise_seeds == [101, 202, 303, 404, 505, 606, 707, 808]

@@ -413,6 +413,7 @@ class BehaviorPrecomputed:
         norm_stats_path: str | Path | None = None,
         reward_mode: str = "required",
         collapse_prob: float = 0.0,
+        episode_indices: tuple[int, ...] | None = None,
         max_trajectories: int | None = None,
         latent_root: str | Path | None = None,
         task_feature_root: str | Path | None = None,
@@ -473,6 +474,19 @@ class BehaviorPrecomputed:
                     )
                 manifests.append(manifest)
         manifests.sort(key=lambda manifest: int(manifest["episode_index"]))
+        if episode_indices is not None:
+            if not episode_indices or any(
+                isinstance(value, bool) or not isinstance(value, int) for value in episode_indices
+            ):
+                raise ValueError("episode_indices must contain one or more integer episode IDs")
+            if len(set(episode_indices)) != len(episode_indices):
+                raise ValueError("episode_indices must not contain duplicates")
+            requested = set(episode_indices)
+            available = {int(manifest["episode_index"]) for manifest in manifests}
+            if missing := requested - available:
+                raise ValueError(f"Requested episodes are absent from split {split!r}: {sorted(missing)}")
+            by_index = {int(manifest["episode_index"]): manifest for manifest in manifests}
+            manifests = [by_index[index] for index in episode_indices]
         if max_trajectories is not None:
             if isinstance(max_trajectories, bool) or not isinstance(max_trajectories, int) or max_trajectories <= 0:
                 raise ValueError("max_trajectories must be a positive integer")

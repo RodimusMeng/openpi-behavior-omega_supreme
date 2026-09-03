@@ -146,6 +146,8 @@ class PredictionBatch:
     target_states: np.ndarray
     persistence_states: np.ndarray
     transition_valid: np.ndarray
+    predicted_latents: Mapping[str, np.ndarray] | None = None
+    target_latents: Mapping[str, np.ndarray] | None = None
     decoded_predicted: Mapping[str, np.ndarray] | None = None
     decoded_target: Mapping[str, np.ndarray] | None = None
 
@@ -258,6 +260,8 @@ class UpstreamWeaverPredictor:
             target_states=target_states,
             persistence_states=persistence_states,
             transition_valid=transition_mask,
+            predicted_latents={key: _to_numpy(value) for key, value in predicted_future.items() if key != "states"},
+            target_latents={key: _to_numpy(value) for key, value in target_future.items() if key != "states"},
             decoded_predicted=decoded_predicted,
             decoded_target=decoded_target,
         )
@@ -471,9 +475,25 @@ class _RgbSums:
         return cls(zeros(), zeros(), zeros(), zeros(), zeros())
 
 
+@dataclasses.dataclass
+class _LatentSums:
+    squared: np.ndarray
+    elements: np.ndarray
+    samples: np.ndarray
+
+    @classmethod
+    def create(cls, horizon: int) -> _LatentSums:
+        return cls(
+            np.zeros(horizon, dtype=np.float64),
+            np.zeros(horizon, dtype=np.float64),
+            np.zeros(horizon, dtype=np.float64),
+        )
+
+
 class _Aggregate:
     def __init__(self, horizons: tuple[int, ...], *, rgb_data_range: float) -> None:
         self.state = {horizon: _StateSums.create(horizon) for horizon in horizons}
+        self.latent: dict[int, dict[str, _LatentSums]] = {horizon: {} for horizon in horizons}
         self.rgb: dict[int, dict[str, _RgbSums]] = {horizon: {} for horizon in horizons}
         self.rgb_data_range = rgb_data_range
         self.record_count = 0
@@ -507,6 +527,32 @@ class _Aggregate:
             state_sums.persistence_squared[lead] += np.square(persistence_error[selected, lead]).sum()
             state_sums.elements[lead] += int(selected.sum()) * dimension
             state_sums.samples[lead] += int(selected.sum())
+
+        latent_records: dict[str, list[dict[str, Any]]] = {}
+        if prediction.predicted_latents is not None and prediction.target_latents is not None:
+            for view in sorted(prediction.predicted_latents):
+                pred_latent = np.asarray(prediction.predicted_latents[view], dtype=np.float64)
+                target_latent = np.asarray(prediction.target_latents[view], dtype=np.float64)
+                squared = np.square(pred_latent - target_latent)
+                per_sample_mse = squared.reshape(squared.shape[0], horizon, -1).mean(axis=2)
+                latent_sums = self.latent[horizon].setdefault(view, _LatentSums.create(horizon))
+                element_count = int(np.prod(squared.shape[2:]))
+                for lead in range(horizon):
+                    selected = valid[:, lead]
+                    if selected.any():
+                        latent_sums.squared[lead] += squared[selected, lead].sum()
+                        latent_sums.elements[lead] += int(selected.sum()) * element_count
+                        latent_sums.samples[lead] += int(selected.sum())
+                latent_records[view] = [
+                    {
+                        "lead": lead + 1,
+                        "valid": bool(valid[index, lead]),
+                        "mse": float(per_sample_mse[index, lead]) if valid[index, lead] else None,
+                        "rmse": float(np.sqrt(per_sample_mse[index, lead])) if valid[index, lead] else None,
+                    }
+                    for index in range(pred.shape[0])
+                    for lead in range(horizon)
+                ]
 
         rgb_records: dict[str, list[dict[str, Any]]] = {}
         if prediction.decoded_predicted is not None and prediction.decoded_target is not None:
@@ -575,12 +621,17 @@ class _Aggregate:
                 record["decoded_rgb_metrics"] = {
                     view: rows[index * horizon : (index + 1) * horizon] for view, rows in rgb_records.items()
                 }
+            if latent_records:
+                record["latent_metrics"] = {
+                    view: rows[index * horizon : (index + 1) * horizon] for view, rows in latent_records.items()
+                }
             records.append(record)
         self.record_count += len(records)
         return records
 
     def summary(self) -> dict[str, Any]:
         state_summary = {}
+        latent_summary = {}
         rgb_summary = {}
         for horizon, sums in self.state.items():
             leads = []
@@ -607,6 +658,32 @@ class _Aggregate:
                     "persistence_rmse": _root_mean(sums.persistence_squared.sum(), total_elements),
                 },
             }
+
+            if self.latent[horizon]:
+                latent_summary[str(horizon)] = {}
+                for view, latent_sums in sorted(self.latent[horizon].items()):
+                    leads = []
+                    for lead in range(horizon):
+                        elements = int(latent_sums.elements[lead])
+                        mse = _divide(latent_sums.squared[lead], elements)
+                        leads.append(
+                            {
+                                "lead": lead + 1,
+                                "valid_samples": int(latent_sums.samples[lead]),
+                                "mse": mse,
+                                "rmse": math.sqrt(mse) if mse is not None else None,
+                            }
+                        )
+                    total_elements = int(latent_sums.elements.sum())
+                    mse = _divide(latent_sums.squared.sum(), total_elements)
+                    latent_summary[str(horizon)][view] = {
+                        "by_lead": leads,
+                        "overall": {
+                            "valid_elements": total_elements,
+                            "mse": mse,
+                            "rmse": math.sqrt(mse) if mse is not None else None,
+                        },
+                    }
 
             if self.rgb[horizon]:
                 rgb_summary[str(horizon)] = {}
@@ -641,6 +718,8 @@ class _Aggregate:
                         )
                     rgb_summary[str(horizon)][view] = {"by_lead": view_leads, "overall": overall}
         result: dict[str, Any] = {"canonical_state": state_summary}
+        if latent_summary:
+            result["latent"] = latent_summary
         if rgb_summary:
             result["decoded_rgb"] = rgb_summary
         return result
@@ -699,6 +778,24 @@ def _validate_prediction(prediction: PredictionBatch, *, horizon: int) -> int:
                 raise ValueError(f"Decoded view {view!r} must share shape (B,H,3,Y,X), got {pred_rgb.shape}")
             if not np.isfinite(pred_rgb).all() or not np.isfinite(target_rgb).all():
                 raise ValueError(f"Decoded view {view!r} contains non-finite values")
+    predicted_latents = prediction.predicted_latents
+    target_latents = prediction.target_latents
+    if (predicted_latents is None) != (target_latents is None):
+        raise ValueError("Predicted and target latent mappings must be enabled together")
+    if predicted_latents is not None and target_latents is not None:
+        if set(predicted_latents) != set(target_latents) or not predicted_latents:
+            raise ValueError("Predicted and target latent view names must match and be non-empty")
+        for view in predicted_latents:
+            pred_latent = np.asarray(predicted_latents[view])
+            target_latent = np.asarray(target_latents[view])
+            if (
+                pred_latent.ndim < 3
+                or pred_latent.shape[:2] != pred.shape[:2]
+                or pred_latent.shape != target_latent.shape
+            ):
+                raise ValueError(f"Latent view {view!r} must share shape (B,H,...), got {pred_latent.shape}")
+            if not np.isfinite(pred_latent).all() or not np.isfinite(target_latent).all():
+                raise ValueError(f"Latent view {view!r} contains non-finite values")
     return int(pred.shape[0])
 
 
@@ -741,7 +838,7 @@ def _field_values(value: Any, *, batch_size: int, name: str) -> list[Any]:
         if array.shape[0] != batch_size:
             raise ValueError(f"{name} length {array.shape[0]} does not match batch_size={batch_size}")
         return [array[index].item() if array[index].ndim == 0 else array[index].tolist() for index in range(batch_size)]
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
         if len(value) != batch_size:
             raise ValueError(f"{name} length {len(value)} does not match batch_size={batch_size}")
         return list(value)
@@ -823,7 +920,7 @@ def _state_error(predicted: np.ndarray, target: np.ndarray) -> np.ndarray:
 
 
 def _horizons(values: Sequence[int]) -> tuple[int, ...]:
-    if isinstance(values, (str, bytes)):
+    if isinstance(values, str | bytes):
         raise ValueError("horizons must be a sequence of positive integers")
     result = tuple(sorted(set(values)))
     if not result:

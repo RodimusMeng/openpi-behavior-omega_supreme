@@ -232,11 +232,18 @@ class _StaticPredictor:
         pred_rgb[0, 1] = 0.2
         pred_rgb[1, 0] = 0.3
         pred_rgb[1, 1] = 0.4
+        pred_latent = np.empty((2, 2, 2), dtype=np.float64)
+        pred_latent[0, 0] = 1.0
+        pred_latent[0, 1] = 2.0
+        pred_latent[1, 0] = 3.0
+        pred_latent[1, 1] = 4.0
         return prediction_eval.PredictionBatch(
             predicted_states=predicted,
             target_states=target,
             persistence_states=persistence,
             transition_valid=np.array([[True, True], [True, False]], dtype=np.bool_),
+            predicted_latents={"camera": pred_latent},
+            target_latents={"camera": np.zeros_like(pred_latent)},
             decoded_predicted={"camera": pred_rgb},
             decoded_target={"camera": np.zeros_like(pred_rgb)},
         )
@@ -271,6 +278,9 @@ def test_metric_summary_uses_real_mask_and_persistence_baseline() -> None:
     assert leads[1]["valid_samples"] == 1
     assert leads[1]["mae"] == pytest.approx(2.0)
     assert leads[1]["persistence_mae"] == pytest.approx(5.0)
+    latent = summary["metrics"]["latent"]["2"]["camera"]["by_lead"]
+    assert latent[0]["mse"] == pytest.approx(5.0)
+    assert latent[1]["mse"] == pytest.approx(4.0)
     rgb = summary["metrics"]["decoded_rgb"]["2"]["camera"]["by_lead"]
     assert rgb[0]["mse"] == pytest.approx(0.05)
     assert rgb[1]["mse"] == pytest.approx(0.04)
@@ -278,6 +288,7 @@ def test_metric_summary_uses_real_mask_and_persistence_baseline() -> None:
     assert len(records) == 2
     assert records[1]["state_metrics"][1]["transition_valid"] is False
     assert records[1]["state_metrics"][1]["mae"] is None
+    assert records[1]["latent_metrics"]["camera"][1]["mse"] is None
     json.dumps({"summary": summary, "records": records}, allow_nan=False)
 
 

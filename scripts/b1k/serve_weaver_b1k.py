@@ -426,6 +426,78 @@ class OnlineWeaverPolicy:
             memory = self.model.encode_memory_obs(memory_obs)
         return context, history, memory
 
+    def prime_replan_context(self, observation: dict[str, Any]) -> float:
+        """Encode one fresh observation for simulator-free scoring audits."""
+
+        if self._frames or self._remaining is not None or self._actions_since_commit != 0:
+            raise RuntimeError("prime_replan_context requires a freshly reset policy stream")
+        started = time.perf_counter()
+        self._commit_frame(self._encode_frame(observation), None)
+        return time.perf_counter() - started
+
+    def sample_candidate_pool(self, observation: dict[str, Any]) -> candidate_pool.CandidatePool:
+        return candidate_pool.sample_policy_candidates(
+            self.raw_policy,
+            observation,
+            num_candidates=self.args.num_candidates,
+            action_dim=23,
+        )
+
+    def score_candidate_pool(
+        self,
+        observation: dict[str, Any],
+        pool: candidate_pool.CandidatePool,
+        *,
+        rollout_seed: int | None = None,
+    ) -> tuple[causal_action_adapter.AdaptedCandidateActions, steering_runtime.ScoredCandidatePool, dict[str, float]]:
+        """Adapt and score one frozen pool without changing execution state."""
+
+        if not self._frames:
+            raise RuntimeError("score_candidate_pool requires a primed WEAVER context")
+        if pool.observation_digest != candidate_pool.observation_sha256(observation):
+            raise ValueError("Candidate pool belongs to a different observation")
+        current_state = self.contract.extract_state(np.asarray(observation["robot_r1::proprio"]))
+        edges = np.arange(pool.actions.shape[1] + 1, dtype=np.float64) / self.args.control_hz
+        adapt_started = time.perf_counter()
+        adapted = causal_action_adapter.adapt_candidate_pool_hybrid(
+            pool,
+            self.hybrid_contract,
+            current_state,
+            edges,
+            weaver_action_mean=self.action_mean,
+            weaver_action_std=self.action_std,
+            target_hz=self.args.target_hz,
+            max_horizon=self.args.imagination_horizon,
+        )
+        adapt_seconds = time.perf_counter() - adapt_started
+        context_started = time.perf_counter()
+        context, history, memory = self._context()
+        context_seconds = time.perf_counter() - context_started
+        score_started = time.perf_counter()
+        scored = steering_runtime.imagine_and_score(
+            self.model,
+            context=context,
+            history_actions=history,
+            adapted_actions=adapted,
+            task={"text": self.task_prompt},
+            n_history=int(self.model._n_history),
+            candidate_pool=pool,
+            device=self.args.device,
+            gamma=float(getattr(self.model, "_gamma", 0.995)),
+            criterion=self.args.criterion,
+            memory_tokens=memory,
+            rollout_seed=rollout_seed,
+        )
+        return (
+            adapted,
+            scored,
+            {
+                "adapt_candidates": adapt_seconds,
+                "assemble_context": context_seconds,
+                "imagine_and_score": time.perf_counter() - score_started,
+            },
+        )
+
     def act(self, observation: dict[str, Any]) -> torch.Tensor:
         if np.asarray(observation["robot_r1::proprio"]).ndim != 1:
             raise ValueError("WEAVER serving accepts one unbatched R1Pro stream")
@@ -443,42 +515,9 @@ class OnlineWeaverPolicy:
             self._actions_since_commit = 0
         if self._remaining is None or len(self._remaining) == 0:
             candidate_started = time.perf_counter()
-            pool = candidate_pool.sample_policy_candidates(
-                self.raw_policy, observation, num_candidates=self.args.num_candidates, action_dim=23
-            )
+            pool = self.sample_candidate_pool(observation)
             candidate_seconds = time.perf_counter() - candidate_started
-            current_state = self.contract.extract_state(np.asarray(observation["robot_r1::proprio"]))
-            edges = np.arange(pool.actions.shape[1] + 1, dtype=np.float64) / self.args.control_hz
-            adapt_started = time.perf_counter()
-            adapted = causal_action_adapter.adapt_candidate_pool_hybrid(
-                pool,
-                self.hybrid_contract,
-                current_state,
-                edges,
-                weaver_action_mean=self.action_mean,
-                weaver_action_std=self.action_std,
-                target_hz=self.args.target_hz,
-                max_horizon=self.args.imagination_horizon,
-            )
-            adapt_seconds = time.perf_counter() - adapt_started
-            context_started = time.perf_counter()
-            context, history, memory = self._context()
-            context_seconds = time.perf_counter() - context_started
-            score_started = time.perf_counter()
-            scored = steering_runtime.imagine_and_score(
-                self.model,
-                context=context,
-                history_actions=history,
-                adapted_actions=adapted,
-                task={"text": self.task_prompt},
-                n_history=int(self.model._n_history),
-                candidate_pool=pool,
-                device=self.args.device,
-                gamma=float(getattr(self.model, "_gamma", 0.995)),
-                criterion=self.args.criterion,
-                memory_tokens=memory,
-            )
-            score_seconds = time.perf_counter() - score_started
+            adapted, scored, score_timing = self.score_candidate_pool(observation, pool)
             selected = int(scored.best_index)
             execute_steps = self.args.imagination_horizon * self._control_steps_per_interval
             if execute_steps > pool.actions.shape[1]:
@@ -526,9 +565,7 @@ class OnlineWeaverPolicy:
                 "timing_seconds": {
                     "encode_observation": encode_seconds,
                     "sample_policy_candidates": candidate_seconds,
-                    "adapt_candidates": adapt_seconds,
-                    "assemble_context": context_seconds,
-                    "imagine_and_score": score_seconds,
+                    **score_timing,
                     "replan_total": time.perf_counter() - act_started,
                 },
             }

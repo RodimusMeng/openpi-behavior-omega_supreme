@@ -31,7 +31,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--task-encoder-model", required=True)
     parser.add_argument("--dataset-dir", required=True)
     parser.add_argument("--norm-stats-path", required=True)
+    parser.add_argument("--hybrid-action-contract", required=True)
     parser.add_argument("--output-json", required=True)
+    parser.add_argument("--evaluation-split", choices=("train", "val", "test"), default="train")
+    parser.add_argument("--episode-indices", type=int, nargs="+")
     parser.add_argument("--fresh-device", default="cuda:0")
     parser.add_argument("--trained-device", default="cuda:1")
     parser.add_argument("--max-trajectories", type=int, default=4)
@@ -59,7 +62,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     dataset_cfg = config["dataset"]
     dataset = BehaviorPrecomputed(
         args.dataset_dir,
-        split="train",
+        split=args.evaluation_split,
         horizon=int(config["horizon"]),
         image_keys=tuple(dataset_cfg["img_keys"]),
         n_history=int(config["n_history"]),
@@ -69,10 +72,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         norm_stats_path=args.norm_stats_path,
         reward_mode="disabled",
         collapse_prob=0.0,
-        max_trajectories=args.max_trajectories,
+        episode_indices=None if args.episode_indices is None else tuple(args.episode_indices),
+        max_trajectories=args.max_trajectories if args.episode_indices is None else None,
         latent_root=dataset_cfg.get("latent_root"),
+        hybrid_action_contract_path=args.hybrid_action_contract,
     )
-    _validate_data_contract(config, dataset)
+    evaluation_protocol = _validate_data_contract(config, dataset)
     windows = _evaluation_windows(dataset, fraction=args.window_fraction)
 
     _seed_everything(args.initialization_seed, torch=torch)
@@ -143,12 +148,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         "config": {"path": str(config_path), "sha256": _sha256(config_path)},
         "dataset": {
             "root": str(Path(args.dataset_dir).expanduser().resolve()),
+            "split": dataset.split,
             "episode_indices": [window["episode_index"] for window in windows],
             "window_t": [window["window_t"] for window in windows],
             "window_fraction": args.window_fraction,
             "norm_stats_path": str(Path(args.norm_stats_path).expanduser().resolve()),
         },
         "evaluation": {
+            "protocol": evaluation_protocol,
             "model_mode": "eval",
             "weights": "raw_model",
             "autocast": "bfloat16",
@@ -213,15 +220,24 @@ def _evaluation_windows(dataset: BehaviorPrecomputed, *, fraction: float) -> lis
     return windows
 
 
-def _validate_data_contract(config: Mapping[str, Any], dataset: BehaviorPrecomputed) -> None:
+def _validate_data_contract(config: Mapping[str, Any], dataset: BehaviorPrecomputed) -> str:
     expected_lineage = {
-        "split": "train",
+        "split": dataset.split,
         "episode_count": len(dataset.manifests),
         "episode_indices": [int(manifest["episode_index"]) for manifest in dataset.manifests],
         "semantic_sha256": [str(manifest["semantic_sha256"]) for manifest in dataset.manifests],
     }
-    if config.get("weaver_lineage") != expected_lineage:
-        raise ValueError("Evaluation dataset lineage differs from the trained checkpoint config")
+    training_lineage = config.get("weaver_lineage")
+    if not isinstance(training_lineage, Mapping):
+        raise ValueError("Trained checkpoint config has no WEAVER dataset lineage")
+    if training_lineage == expected_lineage:
+        protocol = "in_sample"
+    else:
+        training_ids = {int(value) for value in training_lineage.get("episode_indices", ())}
+        evaluation_ids = {int(value) for value in expected_lineage["episode_indices"]}
+        if overlap := sorted(training_ids & evaluation_ids):
+            raise ValueError(f"Held-out evaluation overlaps training episode IDs: {overlap}")
+        protocol = "held_out_episode"
     saved_norm = config.get("weaver_norm_provenance")
     actual_norm = dataset.norm_stats_provenance
     if not isinstance(saved_norm, Mapping) or not isinstance(actual_norm, Mapping):
@@ -230,6 +246,23 @@ def _validate_data_contract(config: Mapping[str, Any], dataset: BehaviorPrecompu
     actual_without_path = {key: value for key, value in actual_norm.items() if key != "path"}
     if saved_without_path != actual_without_path:
         raise ValueError("Evaluation normalization provenance differs from the trained checkpoint config")
+    saved_hybrid = _canonical_provenance(config.get("weaver_hybrid_action_provenance"))
+    actual_hybrid = _canonical_provenance(dataset.hybrid_action_provenance)
+    if saved_hybrid is None or actual_hybrid is None or saved_hybrid != actual_hybrid:
+        raise ValueError("Evaluation hybrid action contract differs from the trained checkpoint config")
+    return protocol
+
+
+def _canonical_provenance(value: Any) -> Any:
+    if not isinstance(value, Mapping):
+        return None
+    normalized = dict(value)
+    normalized.pop("path", None)
+    normalized.pop("source_audit_path", None)
+    return {
+        str(key): _canonical_provenance(item) if isinstance(item, Mapping) else item
+        for key, item in sorted(normalized.items(), key=lambda pair: str(pair[0]))
+    }
 
 
 def _evaluate_once(
