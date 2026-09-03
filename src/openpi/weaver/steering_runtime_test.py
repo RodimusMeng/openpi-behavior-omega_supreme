@@ -41,10 +41,17 @@ class _FakeModel:
     def encode_task(self, task):
         return torch.zeros(len(task["text"]), 4)
 
-    def generate_latent_rollouts_variable_horizon(self, *, context, future_actions, future_states, history_actions, memory_tokens):
+    def generate_latent_rollouts_variable_horizon(
+        self, *, context, future_actions, future_states, history_actions, memory_tokens
+    ):
         del future_states, history_actions, memory_tokens
-        # Return a new mapping so tests can detect context mutation/leakage.
-        return {key: value.clone() for key, value in context.items()}
+        batch_size = future_actions.shape[0]
+        camera_history = context["camera"].expand(batch_size, -1, -1, -1)
+        state_history = context["states"].expand(batch_size, -1, -1)
+        return {
+            "camera": torch.cat([camera_history, future_actions[..., :1, None]], dim=1),
+            "states": torch.cat([state_history, future_actions], dim=1),
+        }
 
     def rm(self, imagined, actions, task_embed):
         del imagined, task_embed
@@ -87,6 +94,8 @@ def test_imagine_and_score_batches_one_pool_and_rejects_mismatched_adapter():
     assert result.values.shape == (3, 4)
     assert result.best_index == int(np.argmax(result.scores))
     assert result.source_pool_actions_sha256 == pool.actions_sha256
+    assert result.rollout_diagnostics["states"]["future_shape"] == [3, 3, 23]
+    assert result.rollout_diagnostics["states"]["finite"] is True
 
     mismatched = CandidatePool(np.zeros((3, 3, 23), dtype=np.float32), "0" * 64)
     with pytest.raises(ValueError, match="do not belong"):

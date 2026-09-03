@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+import time
 from typing import Any, Literal
 
 import numpy as np
@@ -126,6 +127,12 @@ def _load_task_prompt_catalog(dataset_dir: str | Path) -> dict[str, str] | None:
     return normalized
 
 
+def load_task_prompt_catalog(dataset_dir: str | Path) -> dict[str, str] | None:
+    """Public shared loader for serving and simulator-free replay."""
+
+    return _load_task_prompt_catalog(dataset_dir)
+
+
 def _resolve_task(
     task: str,
     prompt_override: str | None,
@@ -195,7 +202,7 @@ class Args:
     action_horizon: int = 6
     criterion: str = "advantage"
     checkpoint_mode: Literal["resume", "identity", "b1k_23d_fresh"] = "resume"
-    resize_mode: Literal["letterbox", "center-crop", "stretch"] = "letterbox"
+    resize_mode: Literal["letterbox", "center-crop", "stretch"] = "stretch"
     device: str = "cuda"
     use_ema: bool = True
 
@@ -238,8 +245,10 @@ def _resize_batch(batch: torch.Tensor, size: tuple[int, int], mode: str) -> torc
     source_h, source_w = batch.shape[-2:]
     if mode == "stretch":
         return torch.nn.functional.interpolate(batch, size=size, mode="bilinear", align_corners=False)
-    scale = min(target_h / source_h, target_w / source_w) if mode == "letterbox" else max(
-        target_h / source_h, target_w / source_w
+    scale = (
+        min(target_h / source_h, target_w / source_w)
+        if mode == "letterbox"
+        else max(target_h / source_h, target_w / source_w)
     )
     raw_h = max(1, round(source_h * scale))
     raw_w = max(1, round(source_w * scale))
@@ -248,9 +257,7 @@ def _resize_batch(batch: torch.Tensor, size: tuple[int, int], mode: str) -> torc
         if mode == "letterbox"
         else (max(target_h, raw_h), max(target_w, raw_w))
     )
-    resized = torch.nn.functional.interpolate(
-        batch, size=(resized_h, resized_w), mode="bilinear", align_corners=False
-    )
+    resized = torch.nn.functional.interpolate(batch, size=(resized_h, resized_w), mode="bilinear", align_corners=False)
     if mode == "letterbox":
         pad_h, pad_w = target_h - resized_h, target_w - resized_w
         return torch.nn.functional.pad(
@@ -282,10 +289,21 @@ class _RawCandidatePolicy:
 class OnlineWeaverPolicy:
     """Stateful 5 Hz context/history buffer around the same-pool selector."""
 
-    def __init__(self, *, base_policy: Any, processor: Any, model: Any,
-                 hybrid_contract: hybrid_action.HybridActionContract, state_mean: np.ndarray,
-                 state_std: np.ndarray, action_mean: np.ndarray, action_std: np.ndarray,
-                 task_prompt: str, contract: b1k_contract.B1KWeaverContract, args: Args) -> None:
+    def __init__(
+        self,
+        *,
+        base_policy: Any,
+        processor: Any,
+        model: Any,
+        hybrid_contract: hybrid_action.HybridActionContract,
+        state_mean: np.ndarray,
+        state_std: np.ndarray,
+        action_mean: np.ndarray,
+        action_std: np.ndarray,
+        task_prompt: str,
+        contract: b1k_contract.B1KWeaverContract,
+        args: Args,
+    ) -> None:
         self.base_policy = base_policy
         self.processor = processor
         self.model = model
@@ -302,6 +320,7 @@ class OnlineWeaverPolicy:
         self._history: deque[torch.Tensor] = deque(maxlen=int(model._n_history))
         self._remaining: np.ndarray | None = None
         self._remaining_latent: np.ndarray | None = None
+        self._last_replan: dict[str, Any] | None = None
         ratio = args.control_hz / args.target_hz
         if not np.isfinite(ratio) or not float(ratio).is_integer():
             raise ValueError("control_hz / target_hz must be a positive integer for online interval commits")
@@ -319,7 +338,26 @@ class OnlineWeaverPolicy:
         self._history.clear()
         self._remaining = None
         self._remaining_latent = None
+        self._last_replan = None
         self._actions_since_commit = 0
+
+    @property
+    def last_replan(self) -> dict[str, Any] | None:
+        """Return a detached JSON-safe account of the most recent replan."""
+
+        if self._last_replan is None:
+            return None
+        return json.loads(json.dumps(self._last_replan, allow_nan=False))
+
+    def set_task_prompt(self, prompt: str) -> None:
+        """Reuse loaded policy/model weights for another recorded B1K task."""
+
+        value = str(prompt).strip()
+        if not value:
+            raise ValueError("task prompt must be non-empty")
+        self.task_prompt = value
+        self.processor.text_prompt = value
+        self.reset()
 
     def _encode_frame(self, observation: dict[str, Any]) -> dict[str, torch.Tensor]:
         raw_state = np.asarray(observation["robot_r1::proprio"])
@@ -359,7 +397,9 @@ class OnlineWeaverPolicy:
         if latent_action is None:
             self._history.append(torch.zeros(1, 1, 23, device=self.args.device))
         else:
-            self._history.append(torch.as_tensor(latent_action[None, None], dtype=torch.float32, device=self.args.device))
+            self._history.append(
+                torch.as_tensor(latent_action[None, None], dtype=torch.float32, device=self.args.device)
+            )
 
     def _context(self) -> tuple[dict[str, torch.Tensor], torch.Tensor, Any]:
         if not self._frames:
@@ -375,9 +415,13 @@ class OnlineWeaverPolicy:
         if getattr(self.model, "_use_memory", False) and int(self.model._n_memory_frames) > 0:
             frames = self._real_frames or list(self._frames)
             head = len(frames)
-            selected = [frames[max(0, head - (int(self.model._n_memory_frames) - i) * int(self.model._t_memory))]
-                       for i in range(int(self.model._n_memory_frames))]
-            memory_obs = {key + "_features": torch.cat([frame[key] for frame in selected], dim=1) for key in self.model._img_keys}
+            selected = [
+                frames[max(0, head - (int(self.model._n_memory_frames) - i) * int(self.model._t_memory))]
+                for i in range(int(self.model._n_memory_frames))
+            ]
+            memory_obs = {
+                key + "_features": torch.cat([frame[key] for frame in selected], dim=1) for key in self.model._img_keys
+            }
             memory_obs["states"] = torch.cat([frame["states"] for frame in selected], dim=1)
             memory = self.model.encode_memory_obs(memory_obs)
         return context, history, memory
@@ -385,7 +429,10 @@ class OnlineWeaverPolicy:
     def act(self, observation: dict[str, Any]) -> torch.Tensor:
         if np.asarray(observation["robot_r1::proprio"]).ndim != 1:
             raise ValueError("WEAVER serving accepts one unbatched R1Pro stream")
+        act_started = time.perf_counter()
+        encode_started = time.perf_counter()
         frame = self._encode_frame(observation)
+        encode_seconds = time.perf_counter() - encode_started
         if not self._frames:
             self._commit_frame(frame, None)
         elif self._actions_since_commit == self._control_steps_per_interval:
@@ -395,29 +442,96 @@ class OnlineWeaverPolicy:
             self._remaining_latent = self._remaining_latent[1:]
             self._actions_since_commit = 0
         if self._remaining is None or len(self._remaining) == 0:
-            pool = candidate_pool.sample_policy_candidates(self.raw_policy, observation,
-                                                            num_candidates=self.args.num_candidates, action_dim=23)
+            candidate_started = time.perf_counter()
+            pool = candidate_pool.sample_policy_candidates(
+                self.raw_policy, observation, num_candidates=self.args.num_candidates, action_dim=23
+            )
+            candidate_seconds = time.perf_counter() - candidate_started
             current_state = self.contract.extract_state(np.asarray(observation["robot_r1::proprio"]))
             edges = np.arange(pool.actions.shape[1] + 1, dtype=np.float64) / self.args.control_hz
+            adapt_started = time.perf_counter()
             adapted = causal_action_adapter.adapt_candidate_pool_hybrid(
-                pool, self.hybrid_contract, current_state, edges,
-                weaver_action_mean=self.action_mean, weaver_action_std=self.action_std,
+                pool,
+                self.hybrid_contract,
+                current_state,
+                edges,
+                weaver_action_mean=self.action_mean,
+                weaver_action_std=self.action_std,
                 target_hz=self.args.target_hz,
                 max_horizon=self.args.imagination_horizon,
             )
+            adapt_seconds = time.perf_counter() - adapt_started
+            context_started = time.perf_counter()
             context, history, memory = self._context()
+            context_seconds = time.perf_counter() - context_started
+            score_started = time.perf_counter()
             scored = steering_runtime.imagine_and_score(
-                self.model, context=context, history_actions=history, adapted_actions=adapted,
-                task={"text": self.task_prompt}, n_history=int(self.model._n_history), candidate_pool=pool,
-                device=self.args.device, gamma=float(getattr(self.model, "_gamma", 0.995)),
-                criterion=self.args.criterion, memory_tokens=memory,
+                self.model,
+                context=context,
+                history_actions=history,
+                adapted_actions=adapted,
+                task={"text": self.task_prompt},
+                n_history=int(self.model._n_history),
+                candidate_pool=pool,
+                device=self.args.device,
+                gamma=float(getattr(self.model, "_gamma", 0.995)),
+                criterion=self.args.criterion,
+                memory_tokens=memory,
             )
+            score_seconds = time.perf_counter() - score_started
             selected = int(scored.best_index)
             execute_steps = self.args.imagination_horizon * self._control_steps_per_interval
             if execute_steps > pool.actions.shape[1]:
                 raise ValueError("Selected policy chunk is shorter than its scored execution window")
             self._remaining = np.array(pool.actions[selected, :execute_steps], copy=True)
             self._remaining_latent = np.array(adapted.normalized_weaver_actions[selected], copy=True)
+            candidate_flat = pool.actions.reshape(pool.num_candidates, -1).astype(np.float64)
+            pairwise_rms = [
+                float(np.sqrt(np.mean(np.square(candidate_flat[left] - candidate_flat[right]))))
+                for left in range(pool.num_candidates)
+                for right in range(left + 1, pool.num_candidates)
+            ]
+            self._last_replan = {
+                "schema_version": "b1k_weaver_replan_diagnostics_v1",
+                "observation_sha256": pool.observation_digest,
+                "pool_actions_sha256": pool.actions_sha256,
+                "candidate_ids": list(pool.candidate_ids),
+                "candidate_actions_shape": list(pool.actions.shape),
+                "candidate_actions_dtype": str(pool.actions.dtype),
+                "candidate_actions_finite": bool(np.isfinite(pool.actions).all()),
+                "candidate_action_summaries": [
+                    {
+                        "candidate_id": pool.candidate_ids[index],
+                        "min": float(pool.actions[index].min()),
+                        "max": float(pool.actions[index].max()),
+                        "mean": float(pool.actions[index].mean()),
+                        "std": float(pool.actions[index].std()),
+                    }
+                    for index in range(pool.num_candidates)
+                ],
+                "candidate_pairwise_rms_min": min(pairwise_rms) if pairwise_rms else 0.0,
+                "candidate_pairwise_rms_max": max(pairwise_rms) if pairwise_rms else 0.0,
+                "adapted_actions_shape": list(adapted.normalized_weaver_actions.shape),
+                "adapted_actions_finite": bool(np.isfinite(adapted.normalized_weaver_actions).all()),
+                "action_representation": adapted.action_representation,
+                "criterion": scored.criterion,
+                "rewards": np.asarray(scored.rewards).tolist(),
+                "values": None if scored.values is None else np.asarray(scored.values).tolist(),
+                "scores": np.asarray(scored.scores).tolist(),
+                "selected_index": selected,
+                "selected_candidate_id": pool.candidate_ids[selected],
+                "selected_action_first": pool.actions[selected, 0].tolist(),
+                "execute_steps": execute_steps,
+                "rollout": scored.rollout_diagnostics,
+                "timing_seconds": {
+                    "encode_observation": encode_seconds,
+                    "sample_policy_candidates": candidate_seconds,
+                    "adapt_candidates": adapt_seconds,
+                    "assemble_context": context_seconds,
+                    "imagine_and_score": score_seconds,
+                    "replan_total": time.perf_counter() - act_started,
+                },
+            }
             LOGGER.info(
                 "WEAVER replan pool=%s selected=%d candidate=%s criterion=%s scores=%s execute_steps=%d",
                 pool.actions_sha256,
@@ -433,10 +547,11 @@ class OnlineWeaverPolicy:
         return torch.as_tensor(action, dtype=torch.float32, device="cpu")
 
 
-def main(args: Args) -> None:
+def build_online_weaver_policy(args: Args) -> OnlineWeaverPolicy:
+    """Build the exact policy used by both WebSocket serving and offline replay."""
+
     from openpi.configs.tasks import TASK_REGISTRY  # noqa: PLC0415
     from openpi.policies import policy_config  # noqa: PLC0415
-    from openpi.serving import websocket_b1k_server  # noqa: PLC0415
     from openpi.shared.eval_b1k_wrapper import B1KPolicyWrapper  # noqa: PLC0415
 
     required_paths = {
@@ -453,16 +568,17 @@ def main(args: Args) -> None:
         raise ValueError(f"Required WEAVER serving paths are empty: {empty_paths}")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("WEAVER serving requested CUDA but torch.cuda.is_available() is false")
-    prompt_catalog = _load_task_prompt_catalog(args.dataset_dir)
-    task_bucket, task_name, prompt = _resolve_task(
+    prompt_catalog = load_task_prompt_catalog(args.dataset_dir)
+    _, _, prompt = _resolve_task(
         args.task,
         args.prompt,
         TASK_REGISTRY,
         prompt_catalog,
     )
     raw_config = yaml.safe_load(Path(args.weaver_config).expanduser().resolve().read_text(encoding="utf-8"))
-    config, _ = upstream_config.build_behavior_config(raw_config, dataset_root=args.dataset_dir,
-                                                       norm_stats_path=args.norm_stats, dynamics_only=False)
+    config, _ = upstream_config.build_behavior_config(
+        raw_config, dataset_root=args.dataset_dir, norm_stats_path=args.norm_stats, dynamics_only=False
+    )
     if args.criterion not in {"reward", "advantage"}:
         raise ValueError("criterion must be 'reward' or 'advantage'")
     model = upstream_runtime.build_model(
@@ -470,9 +586,9 @@ def main(args: Args) -> None:
         device=args.device,
         task_encoder_model=args.task_encoder_model,
     )
-    upstream_runtime.load_checkpoint_into_model(model, args.weaver_checkpoint,
-                                                mode=args.checkpoint_mode,
-                                                device=args.device)
+    upstream_runtime.load_checkpoint_into_model(
+        model, args.weaver_checkpoint, mode=args.checkpoint_mode, device=args.device
+    )
     if args.use_ema:
         model.ema.ema.copy_to(parameter for parameter in model.parameters() if parameter.requires_grad)
     model.eval()
@@ -483,24 +599,49 @@ def main(args: Args) -> None:
 
     policy_cfg = __import__("openpi.training.config", fromlist=["get_config"]).get_config(args.policy_config)
     policy_cfg = _require_checkpoint_policy_contract(policy_cfg, robot=args.robot)
-    base = policy_config.create_trained_policy(policy_cfg, args.policy_dir,
-                                               sample_kwargs={"num_steps": args.num_flow_steps}, default_prompt=prompt)
+    base = policy_config.create_trained_policy(
+        policy_cfg, args.policy_dir, sample_kwargs={"num_steps": args.num_flow_steps}, default_prompt=prompt
+    )
     causal_action_adapter.require_world_model_horizon(
-        int(policy_cfg.model.action_horizon), args.imagination_horizon,
-        control_hz=args.control_hz, target_hz=args.target_hz,
+        int(policy_cfg.model.action_horizon),
+        args.imagination_horizon,
+        control_hz=args.control_hz,
+        target_hz=args.target_hz,
     )
     model._gamma = float(config.get("model", {}).get("discount_factor", 0.995))
-    processor = B1KPolicyWrapper(policy=base, robot=args.robot, text_prompt=prompt,
-                                 control_mode="receding_horizon", action_horizon=args.action_horizon,
-                                 max_len=int(policy_cfg.model.action_horizon))
-    policy = OnlineWeaverPolicy(base_policy=base, processor=processor, model=model,
-                                hybrid_contract=hybrid_contract, state_mean=state_mean, state_std=state_std,
-                                action_mean=action_mean, action_std=action_std, task_prompt=prompt,
-                                contract=b1k_contract.build_r1pro_contract(), args=args)
+    processor = B1KPolicyWrapper(
+        policy=base,
+        robot=args.robot,
+        text_prompt=prompt,
+        control_mode="receding_horizon",
+        action_horizon=args.action_horizon,
+        max_len=int(policy_cfg.model.action_horizon),
+    )
+    policy = OnlineWeaverPolicy(
+        base_policy=base,
+        processor=processor,
+        model=model,
+        hybrid_contract=hybrid_contract,
+        state_mean=state_mean,
+        state_std=state_std,
+        action_mean=action_mean,
+        action_std=action_std,
+        task_prompt=prompt,
+        contract=b1k_contract.build_r1pro_contract(),
+        args=args,
+    )
     policy.set_model_config(config)
-    metadata = getattr(base, "metadata", {})
-    websocket_b1k_server.WebsocketPolicyServer(policy=policy, host="0.0.0.0", port=args.port,
-                                               metadata={**metadata, "weaver_steering": True}).serve_forever()
+    return policy
+
+
+def main(args: Args) -> None:
+    from openpi.serving import websocket_b1k_server  # noqa: PLC0415
+
+    policy = build_online_weaver_policy(args)
+    metadata = getattr(policy.base_policy, "metadata", {})
+    websocket_b1k_server.WebsocketPolicyServer(
+        policy=policy, host="0.0.0.0", port=args.port, metadata={**metadata, "weaver_steering": True}
+    ).serve_forever()
 
 
 if __name__ == "__main__":

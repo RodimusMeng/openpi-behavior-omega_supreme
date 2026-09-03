@@ -25,6 +25,11 @@ def test_server_requires_pinned_task_encoder_model() -> None:
     assert field.default is dataclasses.MISSING
 
 
+def test_server_defaults_to_the_training_latent_resize_contract() -> None:
+    field = next(field for field in dataclasses.fields(Args) if field.name == "resize_mode")
+    assert field.default == "stretch"
+
+
 def test_broad_absolute_checkpoint_config_keeps_controller_actions_absolute() -> None:
     cfg = training_config.get_config("pi05_b1k_full_abs")
     assert cfg.model.action_horizon == 32

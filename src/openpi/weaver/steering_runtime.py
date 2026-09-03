@@ -35,6 +35,7 @@ class ScoredCandidatePool:
     source_pool_actions_sha256: str
     imagined_horizon: int
     oracle_scores: np.ndarray | None = None
+    rollout_diagnostics: Mapping[str, Mapping[str, Any]] | None = None
 
     def __post_init__(self) -> None:
         rewards = _finite(self.rewards, name="rewards", ndim=2)
@@ -59,6 +60,22 @@ class ScoredCandidatePool:
             raise ValueError("imagined_horizon must match a positive reward horizon")
         if len(self.source_pool_actions_sha256) != 64:
             raise ValueError("source_pool_actions_sha256 must be a SHA-256 digest")
+        if self.rollout_diagnostics is not None:
+            diagnostics = {str(key): dict(value) for key, value in self.rollout_diagnostics.items()}
+            if not diagnostics:
+                raise ValueError("rollout_diagnostics must be non-empty when supplied")
+            for key, value in diagnostics.items():
+                shape = value.get("shape")
+                future_shape = value.get("future_shape")
+                if not isinstance(shape, (list, tuple)) or not isinstance(future_shape, (list, tuple)):
+                    raise ValueError(f"rollout diagnostic {key!r} must contain shape and future_shape")
+                if not shape or not future_shape or int(shape[0]) != rewards.shape[0]:
+                    raise ValueError(f"rollout diagnostic {key!r} has the wrong candidate axis")
+                if int(future_shape[0]) != rewards.shape[0] or int(future_shape[1]) != self.imagined_horizon:
+                    raise ValueError(f"rollout diagnostic {key!r} has the wrong future horizon")
+                if value.get("finite") is not True:
+                    raise ValueError(f"rollout diagnostic {key!r} contains non-finite predictions")
+            object.__setattr__(self, "rollout_diagnostics", diagnostics)
         object.__setattr__(self, "rewards", rewards)
         object.__setattr__(self, "scores", scores)
 
@@ -178,7 +195,11 @@ def imagine_and_score(
         if memory_tokens.shape[0] == 1:
             memory_tokens = memory_tokens.expand(batch_size, *memory_tokens.shape[1:])
     actions_full = torch.cat([hist, actions], dim=1)
-    autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_autocast and str(device).startswith("cuda") else nullcontext()
+    autocast = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if use_autocast and str(device).startswith("cuda")
+        else nullcontext()
+    )
     with torch.no_grad(), autocast:
         imagined = model.generate_latent_rollouts_variable_horizon(
             context=context_batch,
@@ -196,6 +217,7 @@ def imagine_and_score(
         criterion=criterion,
         values_all=values_all,
     )
+    rollout_diagnostics = _summarize_rollout(imagined, n_history=n_history, torch=torch)
     oracle = None if oracle_scores is None else np.asarray(oracle_scores, dtype=np.float64)
     return ScoredCandidatePool(
         candidate_ids=candidate_pool.candidate_ids,
@@ -207,7 +229,44 @@ def imagine_and_score(
         source_pool_actions_sha256=candidate_pool.actions_sha256,
         imagined_horizon=horizon,
         oracle_scores=oracle,
+        rollout_diagnostics=rollout_diagnostics,
     )
+
+
+def _summarize_rollout(
+    imagined: Mapping[str, Any],
+    *,
+    n_history: int,
+    torch: Any,
+) -> dict[str, dict[str, Any]]:
+    """Return small, JSON-safe diagnostics without retaining rollout tensors."""
+
+    result: dict[str, dict[str, Any]] = {}
+    for key, raw_value in imagined.items():
+        value = raw_value if hasattr(raw_value, "detach") else torch.as_tensor(raw_value)
+        if value.ndim < 3 or value.shape[1] <= n_history:
+            raise ValueError(f"Imagined rollout {key!r} must have shape (N,n_history+H,...), got {tuple(value.shape)}")
+        future = value[:, n_history:].detach().float()
+        flat = future.reshape(future.shape[0], -1)
+        if flat.shape[0] > 1:
+            pairwise = torch.pdist(flat, p=2) / math.sqrt(flat.shape[1])
+            pairwise_min = float(pairwise.min().cpu())
+            pairwise_max = float(pairwise.max().cpu())
+        else:
+            pairwise_min = 0.0
+            pairwise_max = 0.0
+        result[str(key)] = {
+            "shape": [int(item) for item in value.shape],
+            "future_shape": [int(item) for item in future.shape],
+            "finite": bool(torch.isfinite(future).all().item()),
+            "future_min": float(future.min().cpu()),
+            "future_max": float(future.max().cpu()),
+            "candidate_pairwise_rms_min": pairwise_min,
+            "candidate_pairwise_rms_max": pairwise_max,
+        }
+    if not result:
+        raise ValueError("WEAVER returned an empty imagined rollout")
+    return result
 
 
 def _expand_candidate(value: Any, batch_size: int, *, torch: Any, device: str) -> Any:
