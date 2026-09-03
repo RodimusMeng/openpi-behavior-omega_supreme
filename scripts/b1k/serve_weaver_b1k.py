@@ -161,6 +161,18 @@ def _resolve_task(
         ) from exc
 
 
+def _require_checkpoint_policy_contract(policy_cfg: Any, *, robot: str) -> Any:
+    """Keep checkpoint dataset/assets immutable while validating embodiment."""
+
+    configured_robot = getattr(policy_cfg.data, "robot_config_name", None)
+    if configured_robot != robot:
+        raise ValueError(
+            "The borrowed OpenPI checkpoint must keep its training data contract; "
+            f"config robot={configured_robot!r}, requested robot={robot!r}"
+        )
+    return policy_cfg
+
+
 @dataclasses.dataclass
 class Args:
     robot: str
@@ -470,9 +482,7 @@ def main(args: Args) -> None:
     )
 
     policy_cfg = __import__("openpi.training.config", fromlist=["get_config"]).get_config(args.policy_config)
-    task_repo_id = f"{task_bucket}/{task_name}"
-    data_cfg = dataclasses.replace(policy_cfg.data, repo_id=task_repo_id, robot_config_name=args.robot)
-    policy_cfg = dataclasses.replace(policy_cfg, data=data_cfg)
+    policy_cfg = _require_checkpoint_policy_contract(policy_cfg, robot=args.robot)
     base = policy_config.create_trained_policy(policy_cfg, args.policy_dir,
                                                sample_kwargs={"num_steps": args.num_flow_steps}, default_prompt=prompt)
     causal_action_adapter.require_world_model_horizon(

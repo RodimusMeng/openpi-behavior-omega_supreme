@@ -15,6 +15,7 @@ from scripts.b1k.serve_weaver_b1k import Args
 from scripts.b1k.serve_weaver_b1k import _canonical_prompt_catalog_sha256
 from scripts.b1k.serve_weaver_b1k import _load_norm
 from scripts.b1k.serve_weaver_b1k import _load_task_prompt_catalog
+from scripts.b1k.serve_weaver_b1k import _require_checkpoint_policy_contract
 from scripts.b1k.serve_weaver_b1k import _resize_batch
 from scripts.b1k.serve_weaver_b1k import _resolve_task
 
@@ -29,7 +30,12 @@ def test_broad_absolute_checkpoint_config_keeps_controller_actions_absolute() ->
     assert cfg.model.action_horizon == 32
     assert cfg.model.action_dim == 32
     assert cfg.data.robot_config_name == "b1k/R1Pro"
+    assert cfg.data.repo_id == "b1k-v3again"
+    assert cfg.data.assets.asset_id is None
     assert cfg.data.extra_delta_transform is False
+    assert _require_checkpoint_policy_contract(cfg, robot="b1k/R1Pro") is cfg
+    with pytest.raises(ValueError, match="training data contract"):
+        _require_checkpoint_policy_contract(cfg, robot="b1k/Other")
 
 
 def test_resize_letterbox_matches_target_shape_and_range() -> None:
