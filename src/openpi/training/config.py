@@ -448,7 +448,6 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             action_sequence_keys=(robot_config.action_key,),
             use_quantile_norm=False,
         )
-
 @dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
@@ -614,6 +613,18 @@ class TrainConfig:
     # PyTorch DataLoader tuning
     prefetch_factor: int | None = None
     persistent_workers: bool = True
+    # If set, shuffle consecutive samples within each LeRobot episode as blocks.
+    # Every sample still appears exactly once per epoch; only the permutation changes.
+    b1k_block_size: int | None = None
+    # If set, DataLoader workers produce smaller jobs which are concatenated into
+    # ``batch_size`` before host-to-device transfer.
+    loader_microbatch_size: int | None = None
+    # Allow faster workers to return first. This changes only delivery order, not
+    # the sampler's planned sample multiset.
+    loader_in_order: bool = True
+    # Per DataLoader process. Only used by the bounded-cache LeRobot fork when
+    # ``video_backend="torchcodec"``.
+    torchcodec_decoder_cache_size: int | None = None
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -663,6 +674,15 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.b1k_block_size is not None and self.b1k_block_size <= 0:
+            raise ValueError("b1k_block_size must be positive")
+        if self.loader_microbatch_size is not None:
+            if self.loader_microbatch_size <= 0:
+                raise ValueError("loader_microbatch_size must be positive")
+            if self.batch_size % self.loader_microbatch_size != 0:
+                raise ValueError("loader_microbatch_size must divide batch_size")
+        if self.torchcodec_decoder_cache_size is not None and self.torchcodec_decoder_cache_size <= 0:
+            raise ValueError("torchcodec_decoder_cache_size must be positive")
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -784,7 +804,6 @@ _CONFIGS = [
             "2026_behavior_challenge/tiancheng/checkpoints"
         ),
     ),
-    
     # Broad BEHAVIOR-1K absolute-action baseline.
     # Keep this intentionally simple: full multitask data, raw controller
     # actions, low-LR full fine-tuning. More elaborate sampling belongs in
@@ -809,8 +828,12 @@ _CONFIGS = [
                 ),
                 prompt_from_task=True,
                 dataset_kwargs={
-                    "tolerance_s": 5e-4,
+                    # B1K contains valid frames quantized about 1 ms away from
+                    # their parquet timestamp. This is still far below half a
+                    # 30 fps frame (16.7 ms); audit before widening further.
+                    "tolerance_s": 2e-3,
                     "video_backend": "pyav",
+                    "return_uint8": True,
                 },
             ),
             robot_config_name="b1k/R1Pro",
@@ -840,7 +863,7 @@ _CONFIGS = [
         persistent_workers=True,
         fsdp_devices=8,
         num_train_steps=100_000,
-        save_interval=10_000,
+        save_interval=2_000,
         keep_period=20_000,
         assets_base_dir="./outputs/assets",
         checkpoint_base_dir=(
@@ -890,7 +913,6 @@ _CONFIGS = [
             "2026_behavior_challenge/tiancheng/checkpoints"
         ),
     ),
-    
     # Fine-tuning Libero configs.
     #
     # These train configs define the hyperparameters for fine-tuning the base model on your own dataset.

@@ -1,8 +1,8 @@
 from collections.abc import Iterator, Sequence
+import inspect
 import logging
 import multiprocessing
 import os
-import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
@@ -11,6 +11,8 @@ import numpy as np
 import torch
 
 import openpi.models.model as _model
+from openpi.training.block_sampler import EpisodeBlockSampler
+from openpi.training.block_sampler import episode_ranges_from_lerobot
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.training.lerobot_compat as _lerobot_compat
@@ -319,20 +321,38 @@ def create_b1k_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    if config.torchcodec_decoder_cache_size is not None:
+        os.environ["LEROBOT_VIDEO_DECODER_CACHE_SIZE"] = str(config.torchcodec_decoder_cache_size)
+        logging.info("TorchCodec decoder cache capacity per worker=%d", config.torchcodec_decoder_cache_size)
     data_config = config.data.create(config.assets_dirs, config.model)
     dataset = create_b1k_dataset(data_config=data_config, action_horizon=config.model.action_horizon)
+    sampler = None
+    if shuffle and config.b1k_block_size is not None:
+        sampler = EpisodeBlockSampler(
+            episode_ranges_from_lerobot(dataset),
+            block_size=config.b1k_block_size,
+            seed=config.seed,
+        )
+        logging.info(
+            "Enabled B1K episode-local block shuffle: block_size=%d samples=%d",
+            config.b1k_block_size,
+            len(sampler),
+        )
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     data_loader = TorchDataLoader(
         dataset,
         local_batch_size=config.batch_size // jax.process_count(),
         sharding=sharding,
-        shuffle=shuffle,
+        shuffle=shuffle and sampler is None,
+        sampler=sampler,
         num_batches=num_batches,
         num_workers=config.num_workers,
         seed=config.seed,
         prefetch_factor=config.prefetch_factor,
         persistent_workers=config.persistent_workers,
+        loader_microbatch_size=config.loader_microbatch_size,
+        in_order=config.loader_in_order,
     )
 
     return DataLoaderImpl(data_config, data_loader)
@@ -463,6 +483,8 @@ class TorchDataLoader:
         num_workers: int = 0,
         prefetch_factor: int | None = None,
         persistent_workers: bool = True,
+        loader_microbatch_size: int | None = None,
+        in_order: bool = True,
         seed: int = 0,
         framework: str = "jax",
     ):
@@ -479,6 +501,9 @@ class TorchDataLoader:
                 indefinitely.
             num_workers: The number of worker processes to use. If zero, the data loader will
                 execute in the main process.
+            loader_microbatch_size: Number of samples in one worker job. Multiple
+                jobs are concatenated back to ``local_batch_size`` before yielding.
+            in_order: Whether worker results must be returned in submission order.
             seed: The seed to use for shuffling the data.
         """
         if jax.process_count() > 1:
@@ -486,6 +511,24 @@ class TorchDataLoader:
 
         if len(dataset) < local_batch_size:
             raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
+        if shuffle and sampler is not None:
+            raise ValueError("shuffle and sampler are mutually exclusive")
+
+        loader_batch_size = loader_microbatch_size or local_batch_size
+        if loader_batch_size <= 0:
+            raise ValueError("loader_microbatch_size must be positive")
+        if loader_batch_size > local_batch_size or local_batch_size % loader_batch_size != 0:
+            raise ValueError(
+                f"loader_microbatch_size ({loader_batch_size}) must divide local_batch_size ({local_batch_size})"
+            )
+        self._microbatches_per_batch = local_batch_size // loader_batch_size
+        logging.info(
+            "DataLoader worker job size=%d; optimizer batch size=%d; jobs per batch=%d; in_order=%s",
+            loader_batch_size,
+            local_batch_size,
+            self._microbatches_per_batch,
+            in_order,
+        )
 
         # Store sharding - None for PyTorch, JAX sharding for JAX
         self._sharding = sharding
@@ -497,30 +540,34 @@ class TorchDataLoader:
             )
         self._num_batches = num_batches
 
-        mp_context = None
-        if num_workers > 0:
-            mp_context = multiprocessing.get_context("spawn")
-
         generator = torch.Generator()
         generator.manual_seed(seed)
-        
-        loader_kwargs = dict(
-            dataset=dataset,
-            batch_size=local_batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            collate_fn=_collate_fn,
-        )
+
+        loader_kwargs = {
+            "dataset": dataset,
+            "batch_size": loader_batch_size,
+            "shuffle": shuffle,
+            "sampler": sampler,
+            "num_workers": num_workers,
+            "collate_fn": _collate_fn,
+            "generator": generator,
+            "drop_last": self._microbatches_per_batch > 1,
+        }
         if num_workers > 0:
             loader_kwargs.update(
                 persistent_workers=persistent_workers,
-                multiprocessing_context="spawn",
+                multiprocessing_context=multiprocessing.get_context("spawn"),
+                worker_init_fn=_worker_init_fn,
             )
             if prefetch_factor is not None:
                 loader_kwargs["prefetch_factor"] = prefetch_factor
-            
-        self._data_loader = torch.utils.data.DataLoader(**loader_kwargs)
 
+        if "in_order" in inspect.signature(torch.utils.data.DataLoader).parameters:
+            loader_kwargs["in_order"] = in_order
+        elif not in_order:
+            raise RuntimeError("loader_in_order=False requires a PyTorch version whose DataLoader supports in_order")
+
+        self._data_loader = torch.utils.data.DataLoader(**loader_kwargs)
 
     @property
     def torch_loader(self) -> torch.utils.data.DataLoader:
@@ -530,13 +577,22 @@ class TorchDataLoader:
         num_items = 0
         while True:
             data_iter = iter(self._data_loader)
+            microbatches = []
             while True:
                 if self._num_batches is not None and num_items >= self._num_batches:
                     return
                 try:
-                    batch = next(data_iter)
+                    microbatch = next(data_iter)
                 except StopIteration:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
+                microbatches.append(microbatch)
+                if len(microbatches) < self._microbatches_per_batch:
+                    continue
+                if self._microbatches_per_batch == 1:
+                    batch = microbatches[0]
+                else:
+                    batch = jax.tree.map(lambda *xs: np.concatenate([np.asarray(x) for x in xs], axis=0), *microbatches)
+                microbatches.clear()
                 num_items += 1
                 # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
                 if self._sharding is not None:

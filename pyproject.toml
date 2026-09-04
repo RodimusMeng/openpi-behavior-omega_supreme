@@ -67,7 +67,7 @@ override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
 
 [tool.uv.sources]
 openpi-client = { workspace = true }
-lerobot = { git = "https://github.com/RodimusMeng/lerobot", rev = "be542e150aa43c97cf8a47cc518953b749ed71e5" }
+lerobot = { git = "https://github.com/RodimusMeng/lerobot", rev = "ed5267c60b8a80f1e8073361c44b45cc7e57ca64" }
 dlimp = { git = "https://github.com/kvablack/dlimp", rev = "ad72ce3a9b414db2185bc0b38461d4101a65477a" }
 
 [tool.uv.workspace]
