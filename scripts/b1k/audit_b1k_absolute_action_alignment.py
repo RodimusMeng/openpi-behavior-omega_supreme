@@ -12,6 +12,7 @@ import argparse
 from collections import defaultdict
 import json
 from pathlib import Path
+import time
 from typing import Any
 
 import numpy as np
@@ -36,9 +37,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="pi05_b1k_full_abs")
     parser.add_argument("--robot", default="b1k/R1Pro")
-    parser.add_argument("--max-frames", type=int, default=20_000)
+    parser.add_argument("--max-frames", type=int, default=2_000)
     parser.add_argument("--max-state-lag", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--progress-every", type=int, default=100)
     parser.add_argument(
         "--output-json",
         default="outputs/debug/b1k_abs_action_alignment.json",
@@ -100,7 +102,10 @@ def main() -> None:
         raise ValueError("--max-frames must be positive")
     if args.max_state_lag < 1:
         raise ValueError("--max-state-lag must be >= 1")
+    if args.progress_every <= 0:
+        raise ValueError("--progress-every must be positive")
 
+    print("[audit] resolving baseline config...", flush=True)
     train_config = _config.get_config(args.config)
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     robot = ROBOT_REGISTRY[args.robot]
@@ -110,6 +115,7 @@ def main() -> None:
     if data_config.dataset_root is None:
         raise ValueError("B1K config has no dataset_root")
 
+    print(f"[audit] opening metadata: {data_config.dataset_root}", flush=True)
     metadata = _lerobot_compat.LeRobotDatasetMetadata(
         repo_id=data_config.repo_id,
         root=data_config.dataset_root,
@@ -120,6 +126,8 @@ def main() -> None:
     # Match create_b1k_dataset, but explicitly disable videos.
     dataset_kwargs = dict(data_config.dataset_kwargs)
     dataset_kwargs["video_keys"] = []
+    print("[audit] constructing numeric-only LeRobot dataset...", flush=True)
+    t_dataset = time.monotonic()
     dataset = data_config.data_cls(
         root=data_config.dataset_root,
         repo_id=data_config.repo_id,
@@ -128,8 +136,13 @@ def main() -> None:
         },
         **dataset_kwargs,
     )
-
     dataset_len = len(dataset)
+    print(
+        f"[audit] dataset ready: len={dataset_len}, fps={fps:g}, "
+        f"horizon={horizon}, init={time.monotonic() - t_dataset:.1f}s",
+        flush=True,
+    )
+
     rng = np.random.default_rng(args.seed)
     metrics: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     sampled_episodes: set[int] = set()
@@ -138,6 +151,13 @@ def main() -> None:
 
     attempts = 0
     max_attempts = max(args.max_frames * 20, 10_000)
+    t0 = time.monotonic()
+    print(
+        f"[audit] sampling {args.max_frames} valid frames; "
+        f"lag scan=0..{args.max_state_lag}. This uses random dataset access.",
+        flush=True,
+    )
+
     while len(sampled_indices) < args.max_frames and attempts < max_attempts:
         attempts += 1
         index = int(rng.integers(0, dataset_len - args.max_state_lag))
@@ -178,8 +198,12 @@ def main() -> None:
         append_group_metrics(metrics, "action1_minus_state_t+1", action1 - state1)
         append_group_metrics(metrics, "chunk_overlap_action1_vs_next_action0", action1 - next_action0)
 
+        # Reuse already-loaded current/next samples. Only lag>=2 incurs more I/O.
+        lag_samples = {0: current, 1: nxt}
         for lag in range(args.max_state_lag + 1):
-            sample = dataset[index + lag]
+            sample = lag_samples.get(lag)
+            if sample is None:
+                sample = dataset[index + lag]
             if episode_index(sample) != episode:
                 break
             lag_state = np.asarray(
@@ -200,6 +224,17 @@ def main() -> None:
 
         sampled_indices.append(index)
         sampled_episodes.add(episode)
+
+        n = len(sampled_indices)
+        if n == 1 or n % args.progress_every == 0 or n == args.max_frames:
+            elapsed = time.monotonic() - t0
+            rate = n / elapsed if elapsed > 0 else 0.0
+            eta = (args.max_frames - n) / rate if rate > 0 else float("inf")
+            print(
+                f"[audit] {n}/{args.max_frames} valid | attempts={attempts} | "
+                f"episodes={len(sampled_episodes)} | {rate:.2f} frame/s | ETA={eta:.0f}s",
+                flush=True,
+            )
 
     if not sampled_indices:
         raise RuntimeError("Collected zero valid frames")
@@ -226,7 +261,7 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
 
-    print("===== B1K ABSOLUTE ACTION ALIGNMENT =====")
+    print("\n===== B1K ABSOLUTE ACTION ALIGNMENT =====")
     print(f"config        : {args.config}")
     print(f"dataset       : {data_config.dataset_root}")
     print(f"fps           : {fps:g}")
