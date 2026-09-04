@@ -171,6 +171,8 @@ def interval_action(
     contract: HybridActionContract,
     current_state: np.ndarray,
     policy_commands: np.ndarray,
+    *,
+    allow_continuous_gripper: bool = False,
 ) -> np.ndarray:
     state = np.asarray(current_state, dtype=np.float32)
     commands = np.asarray(policy_commands, dtype=np.float32)
@@ -186,16 +188,38 @@ def interval_action(
     grip_command = commands[phase_index(len(commands), contract.gripper_phase)]
     for index in gripper_indices():
         value = float(grip_command[index])
-        if not (np.isclose(value, -1.0, atol=1e-5) or np.isclose(value, 1.0, atol=1e-5)):
-            if abs(value - 1.0) <= 0.10:
-                value = 1.0
-            elif abs(value + 1.0) <= 0.10:
-                value = -1.0
-            else:
-                raise ValueError(
-                    f"Gripper command at index {index} is not close to binary -1/+1: {value}"
-                )
-        result[index] = -1.0 if value < 0 else 1.0
+        if allow_continuous_gripper:
+            # Online flow-policy outputs are continuous. B1K grippers use
+            # binary command semantics, so canonicalize at the policy/action
+            # boundary. The same rule must be used for WEAVER imagination
+            # and real execution.
+            value = -1.0 if value < 0.0 else 1.0
+        else:
+            # Prepared demonstrations are expected to obey the binary
+            # gripper contract. Keep this path strict so malformed source
+            # data is not silently repaired.
+            if not (np.isclose(value, -1.0, atol=1e-5) or np.isclose(value, 1.0, atol=1e-5)):
+                if abs(value - 1.0) <= 0.10:
+                    value = 1.0
+                elif abs(value + 1.0) <= 0.10:
+                    value = -1.0
+                else:
+                    raise ValueError(
+                        f"Gripper command at index {index} is not close to binary -1/+1: {value}"
+                    )
+        result[index] = value
+    return result
+
+
+def canonicalize_policy_gripper_actions(actions: np.ndarray) -> np.ndarray:
+    """Return policy actions with B1K gripper dimensions canonicalized to -1/+1."""
+    result = np.asarray(actions, dtype=np.float32).copy()
+    if result.ndim < 1 or result.shape[-1] != 23:
+        raise ValueError("Policy actions must have final dimension 23")
+    if not np.isfinite(result).all():
+        raise ValueError("Policy actions must be finite")
+    for index in gripper_indices():
+        result[..., index] = np.where(result[..., index] < 0.0, -1.0, 1.0)
     return result
 
 
@@ -226,6 +250,7 @@ def predict_candidate_actions(contract: HybridActionContract, current_state: np.
                 contract,
                 state[candidate],
                 segmented.policy_actions[candidate, horizon, :length],
+                allow_continuous_gripper=True,
             )
         state += output[:, horizon]
         for index in b1k_dataset_adapter.angular_state_indices():

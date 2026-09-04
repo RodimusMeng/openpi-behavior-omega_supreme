@@ -522,7 +522,9 @@ class OnlineWeaverPolicy:
             execute_steps = self.args.imagination_horizon * self._control_steps_per_interval
             if execute_steps > pool.actions.shape[1]:
                 raise ValueError("Selected policy chunk is shorter than its scored execution window")
-            self._remaining = np.array(pool.actions[selected, :execute_steps], copy=True)
+            self._remaining = hybrid_action.canonicalize_policy_gripper_actions(
+                pool.actions[selected, :execute_steps]
+            )
             self._remaining_latent = np.array(adapted.normalized_weaver_actions[selected], copy=True)
             candidate_flat = pool.actions.reshape(pool.num_candidates, -1).astype(np.float64)
             pairwise_rms = [
